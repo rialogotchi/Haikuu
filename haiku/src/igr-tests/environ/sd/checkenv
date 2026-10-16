@@ -1,0 +1,4 @@
+type = process
+command = ../checkenv.sh $TEST_VAR_ONE $HAIKU_SERVICE
+restart = false
+load-options = export-service-name

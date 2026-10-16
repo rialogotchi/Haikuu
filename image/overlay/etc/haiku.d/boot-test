@@ -1,0 +1,7 @@
+# CI duman testi hedefi: kabuk yok, selftest bitince kapanır
+# Çekirdek komut satırına "boot-test" yazılarak seçilir.
+@type       = internal
+@waits-for  = syslog
+@waits-for  = heartbeat
+@waits-for  = webdemo
+@waits-for  = selftest

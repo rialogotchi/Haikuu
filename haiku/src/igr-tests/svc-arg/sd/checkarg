@@ -1,0 +1,5 @@
+type = process
+waits-for = checkarg2@$1
+command = ../checkarg.sh $1
+restart = false
+@include-opt ./inc-$1

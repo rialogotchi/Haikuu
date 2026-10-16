@@ -1,0 +1,10 @@
+Bash completion for Haiku
+-------------------------
+
+This directory contains "haikuctl" bash completion.
+
+ToDo:
+- More commands and flags
+
+For installation copy haikuctl file into your bash-completions directory,
+(Usually "/usr/share/bash-completion/completions/").

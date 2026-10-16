@@ -1,0 +1,6 @@
+# busybox httpd, 127.0.0.1:8080
+@type       = process
+@command    = /usr/sbin/httpd -f -p 127.0.0.1:8080 -h /www
+@depends-on = network
+@restart    = true
+@logfile    = /var/log/haiku/webdemo.log

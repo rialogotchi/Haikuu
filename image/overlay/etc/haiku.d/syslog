@@ -1,0 +1,5 @@
+@type       = process
+@command    = /sbin/syslogd -n -O /var/log/messages
+@depends-on = early-fs
+@restart    = true
+@logfile    = /var/log/haiku/syslog.log

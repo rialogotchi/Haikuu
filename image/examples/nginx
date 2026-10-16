@@ -1,0 +1,14 @@
+# Servis ayarları
+@type           = process
+@run-as         = root
+@restart        = true
+@working-dir    = /
+
+# Bağımlılık (systemd'deki After/Requires mantığı)
+@depends-on     = network
+
+# Çalıştırılacak komut
+@command        = /usr/sbin/nginx -g "daemon off;"
+
+# Loglama
+@logfile        = /var/log/haiku/nginx.log

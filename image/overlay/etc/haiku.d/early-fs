@@ -1,0 +1,4 @@
+# /proc, /sys, /dev, /tmp bağlama
+@type       = scripted
+@command    = /usr/libexec/haiku/early-fs.sh
+@restart    = false

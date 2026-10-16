@@ -1,0 +1,22 @@
+Haiku is maintained primarily by Davin McCall, the initial author.
+
+Extra-special thanks to co-maintainer, Mobin Aydinfar.
+
+The Haiku logo was created by Yakui420.
+
+Special thanks to those who have sponsored Haiku's development:
+ * Artix Linux (https://artixlinux.org/)
+ * Github sponsors: Paweł Zmarzły (pzmarzly), Wesley Moore (wezm), brazeon,
+   M. Herdiansyah (konimex), q66, saolof, Coleman McFarland (dontlaugh),
+   Jakub Gajski (jakubgajski), and private sponsors. 
+
+The following people (in alphabetical order) have contributed to Haiku's code or documentation
+(this includes only those who have chosen to add themselves to this list):
+ * Edd Barrett - Testing, documentation.
+ * Fabien Poussin - Code, services, documentation.
+ * James Knippes - Code
+ * Jami Kettunen - Code
+ * Locria Cyber - Code, documentation
+ * Mobin Aydinfar - Code, documentation, CI
+ * Oliver Amann - Code, testing, documentation
+ * q66 - Code, testing, documentation.

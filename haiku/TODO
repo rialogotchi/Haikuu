@@ -1,0 +1,49 @@
+For version 1.0 (release requirements):
+---------------------------------------
+* Be able to boot and shutdown Linux and FreeBSD (or OpenBSD).
+* Documentation must be complete (mostly done; will need updates as other items are completed).
+* [DONE] signal (SIGUSR1) to open control socket (useful for recovery/single-user)
+
+
+For later (post 1.0):
+---------------------
+* jails support
+* Proper support for socket activation?
+* Perhaps need a way to prevent script services from re-starting.
+  (eg there's no need to mount filesystems twice; there might be various other
+   system initialisations that can't or shouldn't really be "undone" and so do
+   not need to be re-done).
+* on shutdown, after a long interval with no activity, display information about
+  services we are waiting on (and/or, do this when prompted via ^C or C-A-D?)
+* Internationalisation
+* A service can prevent shutdown/reboot by failing to stop. Maybe make
+  multiple CTRL-ALT-DEL presses (or ^C since that's more portable) commence
+  immediate shutdown (or launch a simple control interface).
+* When we take down a service or tty session, it would be ideal if we could kill
+  the whole process tree, not just the leader process (need cgroups or pid
+  namespace or other mechanism).
+* Allow running services chroot, in namespaces (pid/fs/uid), etc
+* Support chaining service output to another process (logger) input; if the
+  service dies the file descriptor of its stdout isn't closed and is reassigned
+  when the service is restarted, so that minimal output is lost. [Done!]
+  - even more, it would be nice if a single logger process could be responsible
+    for receiving output from multiple services. This would require some kind of
+    protocol for passing new output descriptors to the logger (for when a
+    service starts).
+
+
+Even later / Maybe never:
+-------------------------
+* Support recognising /etc/init.d services automatically (as script services, with
+  no dependency management - or upstart compatible dependency management)
+  Also BSD's rc.d style scripts (PROVIDE, REQUIRE).
+* Place some reasonable, soft limit on the number of services to be started
+  simultaneously, to prevent thrashing. Services that are taking a long time
+  to start don't count to the limit. Maybe use CPU/IO usage as a controlling
+  factor.
+* Cron-like tasks (if started, they run a sub-task periodically. Stopping the
+  task will wait until the sub-task is complete). 
+* Allow to run services attached to virtual tty, allow connection to that tty (ala "screen").
+* SystemD-like handling of filesystem mounts (see autofs documentation in kernel)
+  i.e. a mount point gets an autofs attached, and lazily gets mounted when accessed
+  (or is mounted in parallel). Probably put the functionality in a separate daemon.

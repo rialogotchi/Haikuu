@@ -1,0 +1,27 @@
+#!/bin/sh
+
+mkdir -p html
+
+cat > html/style.css <<- EOM
+body    { margin-left: auto; margin-right: auto; width: 60em; padding-left: 1em; padding-right: 1em; padding-top: 0.5em; background: cornsilk; box-shadow: 0 0.8em 2em #000; }
+body > h1:first-child { margin-top: 0; }
+html    { background: darkslategray }  a { color: inherit; text-decoration: none }
+section > p { margin-left: 3em; }
+section > ul { margin-left: 3em; }
+table.head, table.foot { width: 100%; }
+td.head-rtitle, td.foot-os { text-align: right; }
+td.head-vol { text-align: center; }
+dd { margin-left: 3em; margin-bottom: 1em; }
+.Bd-indent { margin-left: 3em; }
+.Nd, .Bf, .Op { display: inline; }
+.Pa, .Ad { font-style: italic; }
+.Ms { font-weight: bold; }
+.Bl-diag > dt { font-weight: bold; }
+code.Nm, .Fl, .Cm, .Ic, code.In, .Fd, .Fn, .Cd { font-weight: bold; font-family: inherit; }
+EOM
+
+cat haiku.8         | mandoc -man -Thtml -Ostyle=style.css > html/haiku.8.html
+cat haiku-check.8   | mandoc -man -Thtml -Ostyle=style.css > html/haiku-check.8.html
+cat haikuctl.8      | mandoc -man -Thtml -Ostyle=style.css > html/haikuctl.8.html
+cat haiku-monitor.8 | mandoc -man -Thtml -Ostyle=style.css > html/haiku-monitor.8.html
+cat haiku-service.5 | mandoc -man -Thtml -Ostyle=style.css > html/haiku-service.5.html

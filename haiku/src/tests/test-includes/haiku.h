@@ -1,0 +1,327 @@
+#ifndef HAIKU_H_INCLUDED
+#define HAIKU_H_INCLUDED 1
+
+// dummy haiku.h
+
+#include <unordered_set>
+#include <map>
+#include <string>
+#include <cassert>
+
+#include <dasynq.h>
+
+using clock_type = dasynq::clock_type;
+using rearm = dasynq::rearm;
+using time_val = dasynq::time_val;
+
+namespace bp_sys {
+    extern pid_t last_forked_pid;
+}
+
+// This is a mock for a Dasynq-based event loop
+class eventloop_t
+{
+    time_val current_time {0, 0};
+
+    public:
+    void get_time(time_val &tv, dasynq::clock_type clock) noexcept
+    {
+        tv = current_time;
+    }
+
+    // Advance the simulated current time by the given amount, and call timer callbacks.
+    void advance_time(time_val amount)
+    {
+        current_time += amount;
+        auto active_copy = active_timers;
+        for (timer * t : active_copy) {
+            if (t->expiry_time <= current_time) {
+                t->stop_timer(*this);
+                rearm r = t->expired(*this, 1);
+                assert(r == rearm::NOOP); // others not handled
+            }
+        }
+    }
+
+    void send_fd_event(int fd, int events)
+    {
+        auto i = regd_fd_watchers.find(fd);
+        if (i != regd_fd_watchers.end()) {
+            fd_watcher *watcher = i->second;
+            dasynq::rearm r = watcher->fd_event(*this, fd, events);
+            if (r == dasynq::rearm::REMOVE) {
+                watcher->deregister(*this);
+            }
+        }
+    }
+
+    class ev_dispatch
+    {
+        public:
+        virtual void dispatch(eventloop_t &) {}
+    };
+
+    class child_proc_watcher : private ev_dispatch
+    {
+        friend class eventloop_t;
+        template <typename Derived> friend class child_proc_watcher_impl;
+
+        public:
+        class proc_status {
+            int wait_si_code; // CLD_EXITED or a signal-related status
+            int wait_si_status; // exit status as per exit(...), or signal number
+
+            public:
+            proc_status() noexcept : wait_si_code(0), wait_si_status(0) {}
+            proc_status(int wait_si_code, int wait_si_status) noexcept
+                : wait_si_code(wait_si_code), wait_si_status(wait_si_status) {}
+            proc_status(const proc_status &) noexcept = default;
+            proc_status &operator=(const proc_status &) noexcept = default;
+
+            bool did_exit() noexcept { return wait_si_code == CLD_EXITED; }
+            bool did_exit_clean() noexcept { return wait_si_status == 0; }
+            bool was_signalled() noexcept { return !did_exit(); }
+            int get_exit_status() noexcept { return wait_si_status; }
+            int get_signal() noexcept { return wait_si_status; }
+
+            int get_si_code() noexcept { return wait_si_code; }
+            int get_si_status() noexcept { return wait_si_status; }
+        };
+
+        using proc_status_t = proc_status;
+
+        private:
+
+        pid_t watched_pid = (pid_t)-1;
+        bool is_reserved = false;
+        proc_status_t proc_status;
+
+        public:
+
+        pid_t fork(eventloop_t &loop, bool reserved_child_watcher, int priority = dasynq::DEFAULT_PRIORITY)
+        {
+            assert (watched_pid == (pid_t)-1);
+            assert(is_reserved == reserved_child_watcher);
+
+            bp_sys::last_forked_pid++;
+            is_reserved = true; // (so that following call to add_reserved succeeds)
+            add_reserved(loop, bp_sys::last_forked_pid, priority);
+            return bp_sys::last_forked_pid;
+        }
+
+        void add_reserved(eventloop_t &loop, pid_t child, int prio = dasynq::DEFAULT_PRIORITY) noexcept
+        {
+            assert(is_reserved);
+            assert(loop.regd_proc_watchers.find(child) == loop.regd_proc_watchers.end());
+            assert(child != (pid_t)-1);
+            assert(watched_pid == (pid_t)-1);
+
+            watched_pid = child;
+            loop.regd_proc_watchers[child] = this;
+        }
+
+        void stop_watch(eventloop_t &loop) noexcept
+        {
+            assert(watched_pid != (pid_t)-1);
+
+            loop.regd_proc_watchers.erase(watched_pid);
+            watched_pid = -1;
+        }
+
+        void deregister(eventloop_t &loop, pid_t child) noexcept
+        {
+            assert(child == watched_pid);
+            loop.regd_proc_watchers.erase(watched_pid);
+            watched_pid = -1;
+            is_reserved = false;
+        }
+
+        void unreserve(eventloop_t &loop) noexcept
+        {
+            assert(watched_pid == (pid_t)-1);
+            assert(is_reserved);
+
+            is_reserved = false;
+        }
+    };
+
+    template <typename Derived> class child_proc_watcher_impl : public child_proc_watcher
+    {
+        void dispatch(eventloop_t &loop) override
+        {
+            Derived *d = (Derived *)this;
+            dasynq::rearm rearm_code = d->status_change(loop, watched_pid, proc_status);
+            if (rearm_code == dasynq::rearm::REMOVED) return;
+            if (rearm_code == dasynq::rearm::NOOP) return;
+            if (rearm_code == dasynq::rearm::REMOVE) {
+                stop_watch(loop);
+                unreserve(loop);
+            }
+            else {
+                assert(false && "Unhandled rearm code from child proc watcher");
+            }
+        }
+    };
+
+    void send_proc_event(pid_t pid, child_proc_watcher::proc_status_t status)
+    {
+        auto i = regd_proc_watchers.find(pid);
+        if (i != regd_proc_watchers.end()) {
+            child_proc_watcher *watcher = i->second;
+            watcher->proc_status = status;
+            ((ev_dispatch *)watcher)->dispatch(*this);
+        }
+    }
+
+    class fd_watcher
+    {
+        int watched_fd;
+
+        public:
+        void add_watch(eventloop_t &loop, int fd, int events, bool enable = true)
+        {
+            if (loop.regd_fd_watchers.find(fd) != loop.regd_fd_watchers.end()
+                    || loop.regd_bidi_watchers.find(fd) != loop.regd_bidi_watchers.end()) {
+                throw std::string("must not add_watch when already active");
+            }
+            watched_fd = fd;
+            loop.regd_fd_watchers[fd] = this;
+        }
+
+        int get_watched_fd() noexcept
+        {
+            return watched_fd;
+        }
+
+        void set_enabled(eventloop_t &loop, bool enable) noexcept
+        {
+
+        }
+
+        void deregister(eventloop_t &loop) noexcept
+        {
+            loop.regd_fd_watchers.erase(watched_fd);
+            watched_fd = -1;
+            watch_removed();
+        }
+
+        virtual rearm fd_event(eventloop_t & loop, int fd, int flags) = 0;
+
+        virtual void watch_removed() noexcept { }
+    };
+
+    template <typename Derived> class fd_watcher_impl : public fd_watcher
+    {
+
+    };
+
+    class bidi_fd_watcher
+    {
+        int watch_flags = -1;
+        int watched_fd = -1;
+
+        public:
+        void set_watches(eventloop_t &eloop, int newFlags) noexcept
+        {
+            watch_flags = newFlags;
+        }
+
+        int get_watches(eventloop_t &eloop) noexcept
+        {
+            return watch_flags;
+        }
+
+        void add_watch(eventloop_t &eloop, int fd, int flags, int inprio = dasynq::DEFAULT_PRIORITY,
+                int outprio = dasynq::DEFAULT_PRIORITY)
+        {
+            if (eloop.regd_bidi_watchers.find(fd) != eloop.regd_bidi_watchers.end()) {
+                throw std::string("must not add_watch when already active");
+            }
+            eloop.regd_bidi_watchers[fd] = this;
+            watched_fd = fd;
+            watch_flags = flags;
+        }
+
+        int get_watched_fd() noexcept
+        {
+            return watched_fd;
+        }
+
+        void deregister(eventloop_t &eloop) noexcept
+        {
+            eloop.regd_bidi_watchers.erase(watched_fd);
+            watched_fd = -1;
+        }
+
+        // In the real implementation these are not virtual, but it is easier for testing if they are:
+        virtual rearm read_ready(eventloop_t &loop, int fd) noexcept = 0;
+        virtual rearm write_ready(eventloop_t &loop, int fd) noexcept = 0;
+    };
+
+    template <typename Derived> class bidi_fd_watcher_impl : public bidi_fd_watcher
+    {
+
+    };
+
+    class timer
+    {
+        friend class eventloop_t;
+
+        private:
+        time_val expiry_time;
+
+        protected:
+        virtual rearm expired(eventloop_t &loop, int expiry_count)
+        {
+            return rearm::NOOP;
+        }
+
+        public:
+        void add_timer(eventloop_t &loop)
+        {
+
+        }
+
+        void arm_timer_rel(eventloop_t &loop, time_val timeout) noexcept
+        {
+            expiry_time = loop.current_time + timeout;
+            loop.active_timers.insert(this);
+        }
+
+        void stop_timer(eventloop_t &loop) noexcept
+        {
+            loop.active_timers.erase(this);
+        }
+
+        void deregister(eventloop_t &loop) noexcept
+        {
+
+        }
+    };
+
+    template <typename Derived> class timer_impl : public timer
+    {
+        protected:
+        virtual rearm expired(eventloop_t &loop, int expiry_count) override
+        {
+            return static_cast<Derived *>(this)->timer_expiry(loop, expiry_count);
+        }
+    };
+
+    std::unordered_set<timer *> active_timers;
+    std::map<int, bidi_fd_watcher *> regd_bidi_watchers;
+    std::map<int, fd_watcher *> regd_fd_watchers;
+    std::map<pid_t, child_proc_watcher *> regd_proc_watchers;
+};
+
+inline void rootfs_is_rw() noexcept
+{
+}
+
+inline void setup_external_log() noexcept
+{
+}
+
+extern eventloop_t event_loop;
+
+#endif

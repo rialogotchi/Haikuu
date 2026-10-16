@@ -1,0 +1,6 @@
+# Konsolda etkileşimli kabuk (kapanınca yeniden açılır)
+@type       = process
+@command    = /bin/cttyhack /bin/sh
+@depends-on = early-fs
+@options    = runs-on-console
+@restart    = true

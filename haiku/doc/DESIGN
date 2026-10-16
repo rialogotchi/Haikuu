@@ -1,0 +1,179 @@
+Haiku Design
+============
+
+NOTE: This document is intended to provide an overview. Specifics are generally included as
+      comments/documentation within source files.
+
+
+Design philosophy
+-----------------
+
+Software design always involves balancing different concerns. Important concerns considered during
+development of Haiku include:
+
+- Usability. The software should be easy to use and understand. Dangerous actions should be
+  guarded (eg stopping a service via haikuctl requires a "--force" argument if it would also cause
+  dependent services to stop). Common use cases should be supported by the feature set.
+  Documentation should be complete. Error messages should be useful. Traceability/debugging is
+  important; errors should be logged appropriately.
+- Transparency. It should be clear what the software is doing. Haiku does not make system-level
+  changes behind the back of the user. Documentation should be clear about what Haiku does.
+  Behaviour should not be surprising to anyone who has read the documentation (and ideally, even
+  to someone who hasn't).
+- Compatibility and interopability. The software should work together with other pre-existing
+  software; it is a piece of a larger puzzle. New interfaces should only be created when they
+  provide a tangible benefit (eg Haiku supports the same readiness protocol as S6, and works with
+  legacy processes that fork after launching via the bgprocess service type. It logs via the
+  standard syslog mechanism).
+- Scope. The feature set is restricted, but is large enough to provide utility and usability.
+  Features that belong elsewhere should remain elsewhere.
+- Generality. Arbitrary restrictions should be avoided. Size is kept small and memory use low to
+  make Haiku usable on systems with limited resources. Code remains portable across different
+  operating systems.
+- Maintainability. Code should be readable and well-documented; it should leverage the compiler's
+  optimisations to remove abstraction penalty, wherever possible, so that the code can be more
+  expressive, and comments should clearly explain why optimisations live "in the code" in cases
+  where it is otherwise necessary.
+
+Of course, there are always trade-offs, but I believe that Haiku strikes a good balance with
+regard to the concerns listed above.
+
+
+Design fundamentals
+-------------------
+
+The design is based around an event loop: events include process termination, signal reception,
+and I/O coming in from control sockets (used to issue service start/stop commands etc via
+haikuctl). The Dasynq library provides the backend event loop functionality; it is included
+with the Haiku source, but has a separate web page and documentation:
+
+    http://davmac.org/projects/dasynq/ 
+
+In Haiku, service actions are often performed by setting "propagation" flags, inserting the
+service in a queue, and then processing the queues. Thus a lot of service actions are performed
+by first calling a function on a service and then draining the propagation queues. More
+information can be found in comments at the beginning of the includes/service.h header.
+
+The logging subsystem is designed to log to two different sinks - typically, one is the console
+and one is the syslog facility, but other arrangements are possible. It uses a circular buffer
+for each output sink, and if the buffer becomes full it discards additional messages to avoid
+blocking (though it flags that this has occurred and later outputs an overflow indication to the
+sink). Services may acquire the console for their exclusive use, and in this case haiku's own
+logging output is discarded and no longer buffered (though it will of course continue to be logged
+to the other sink).
+
+Control protocol handling uses a circular receive buffer, but allocates storage for outgoing
+packets dynamically. If allocation fails an "out of memory" flag is set and the connection is
+closed after writing an "out of memory" information packet.
+
+
+Key considerations
+------------------
+
+Haiku's overall function is fairly straightforward but there are some considerations that cause
+its design to be more complicated than it might otherwise be.  The heart of the issue is that
+Haiku should not stall on I/O and its essential operation should never fail, which means that many
+code paths cannot perform memory allocation for example, and that log messages all go through a
+buffer.
+
+Note that blocking actions are avoided: non-blocking I/O is used where possible; Haiku must
+remain responsive at all times.
+
+In general operation Haiku methods should avoid throwing exceptions and be declared as 'noexcept',
+or otherwise be clearly documented as throwing particular exceptions. Errors should always be
+handled as gracefully as possible and should not prevent Haiku's continued operation. Particular
+care is needed for dynamic allocations: C++ style allocations (including adding elements to C++
+containers, or appending to strings) will raise 'std::bad_alloc' if they cannot allocate memory,
+and this must be handled appropriately. Functions in 'std::vector' and 'std::string' are also able
+to raise 'std::length_error' and it should probably be assumed that other containers can do so as
+well (the C++ language specification is annoyingly unspecific) - although we don't expect to see
+'length_error' in practice, it should be handled anyway.
+
+Repeating for emphasis: Once it has started regular operation, haiku must not terminate due to an
+error condition, even if the error is an allocation failure or another exception.
+
+
+Services
+--------
+
+There are presently five "exposed" service types: internal, triggered, process, bgprocess and
+scripted. The latter three share the fact that they execute external processes and so naturally
+share some implementation. The base service class is "service_record" - this directly supports
+"internal" services (triggered services differ only slightly, but are still implemented via a
+subclass, "triggered_service"). 
+
+The "base_process_service" class extends service_record and serves as a base class for the
+remaining three service types (which all manage external processes) and provides common
+functionality.
+
+Various functions in the service_record / base_process_service classes are virtual, so that they
+can be overridden by the subclasses.
+
+All execution of child processes related to services currently goes through
+service_record::run_child_proc() (after forking).
+
+Services are grouped in a "service_set". This provides the essential interface between the event
+loop and services.
+
+A "placeholder_service" service type also exists; it is used as a placeholder for when a service
+needs to maintain a link to another service but that other service has not yet been loaded (this
+is used for example for "after" and "before" service ordering, since those don't require loading
+the linked service, and "consumer-of" for similar reasons). When any service is loaded, it
+replaces any placeholder service that already exists for it (and links from other services to the
+placeholder are updated to refer to the newly loaded service instead). In a similar way, a service
+which is unloaded but that still has persistent links from other services can be replaced with a
+placeholder. 
+
+
+Source code organisation
+------------------------
+
+Most function comments and general documentation can be found in header files rather than in the
+corresponding source files.
+
+haiku-main.cc - just a wrapper around the entry point; reports exceptions
+
+haiku.cc - main entry point, command line parsing, general initialisation, event loop processing,
+        signal handling, system management (shutdown / reboot etc)
+
+service.cc - base service logic (see service.h)
+
+proc-service.cc, baseproc-service.cc - process-based service logic (see service.h, proc-service.h)
+        This builds on functionality in service.cc
+    
+run-child-proc.cc - contains service_record::run_child_proc(), used to run child processes.
+
+load-service.cc - service loading (see load-service.h)
+
+control.cc - control protocol handling
+
+haiku-log.cc - logging subsystem
+
+haiku-env.cc - mainly a function to read an environment file into an "environment" wrapper (as
+        defined in haiku-env.h)
+
+tests/ - various tests
+igr-tests/ - integration tests
+
+The utility sources are:
+
+haikuctl.cc - the control/status utility
+haiku-check.cc - haiku-check utility
+haiku-monitor.cc - the haiku-monitor utility
+shutdown.cc - shutdown/halt/reboot utility
+
+
+Testing
+-------
+
+The unit tests work by mocking out parts of Haiku, and some system calls, in order to isolate
+functional units. In the src/tests/test-includes directory are some mock headers. When compiling
+tests, these headers are put on the include path before the regular includes directory. 
+
+Note that systems calls are not mocked directly, instead, system calls are wrapped in the bp_sys
+namespace, as defined in the baseproc-sys.h header; this header is one of the headers mocked
+for tests. (This avoids problems that might arise from replacing important system calls, and in
+particular avoids interfering with the test harness itself).
+
+It is important when writing new code in Haiku to avoid calling system calls directly, and to
+instead call the wrapper in bp_sys.

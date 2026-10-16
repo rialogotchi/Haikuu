@@ -1,0 +1,2 @@
+haikuctl: error loading service (or dependency of service).
+haikuctl: try 'haiku-check <service-name>' or check log for more information.

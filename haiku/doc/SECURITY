@@ -1,0 +1,67 @@
+Security concerns
+-----------------
+
+Trust and assumptions
+---------------------
+
+Haiku does assume that most input it receives is trusted and not produced maliciously. This
+includes:
+
+- service descriptions, including service names
+- "environment" file
+- commands received via the control socket
+
+Since it is trusted, Haiku will do no or minimal validation/sanitisation on these. Tools which
+allow creation or modification of these inputs should do so with care. (The control socket is
+treated with a little more care, in an attempt to guard against buggy or partially compromised
+clients, but untrusted applications/users should *not* be granted access to the socket).
+
+Haiku when run as system manager (naturally) also trusts and relies on the general integrity of
+the system on which it runs. It cannot defend against a fully compromised system and does not
+attempt to do so. It does *not* trust or rely on aspects of the system that are (or should not
+be) controlled by non-administrative users. In other words, Haiku should be secure but does not
+by itself aim to provide *additional system* security (except by having features to run services
+more securely).
+
+Haiku does not expect user identities to change during operation. If a service is configured to
+run as user xyz, the numeric ID of user xyz may be determined when the service is loaded rather
+than when the service is started. If the same ID is re-assigned to a different user, Haiku might
+run the service as that other user, create logfiles owned by that other user, etc.
+
+
+Specific concerns and details
+-----------------------------
+ 
+Haiku is designed to allow control by one system user. In the case of a system instance, this is
+the root user. Of course, the unix model allows users to change identity and so regular users can
+control a system haiku instance using sudo or su, for example.
+
+Essential security is enforced by the system, not by Haiku itself. The socket used to control
+haiku is owned by a particular user (the user who starts haiku) and the permissions on this socket
+are set so that only the owning user can connect to the socket. According to the Linux unix(7)
+manual page, "older" BSDs do not honour socket permissions; on such systems, presumably the
+permissions on the containing directory at least are checked (so it is necessary to place the
+socket in a directory that is inaccessible to non-root users to ensure secure operation). This
+does not appear to be a concern for the various current *BSD systems that I have looked at.
+
+In general it should be assumed that a process that is able to open the control socket (or
+otherwise obtain an open connection to the socket) will be able to execute arbitrary code as root
+(or rather, as the user which haiku is running as). That said, errors or missing checks in the
+control protocol handling which could cause unspecified or undefined behaviour are considered a
+security concern (since they potentially allow minor flaws in clients to become arbitrary code
+execution within the haiku daemon).
+
+Haiku service descriptions may specify output files (sockets, logfiles) and these are opened
+without (or with minimal) checks. A malicious user in control of a service description could cause
+arbitrary system files to be overwritten.
+
+
+Reporting security issues
+-------------------------
+
+Bearing the above in mind, any security issues in Haiku should be reported via email to:
+
+    davmac@davmac.org
+    
+I will endeavour to respond promptly, but please allow a reasonable time frame before wider
+disclosure.

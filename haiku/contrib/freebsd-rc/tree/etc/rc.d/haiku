@@ -1,0 +1,30 @@
+#!/bin/sh
+#
+#
+
+# PROVIDE: haiku
+# REQUIRE: LOGIN FILESYSTEMS
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="haiku"
+desc="Simple Init System"
+rcvar="haiku_enable"
+command="/usr/sbin/haikud"
+command_args="-p /var/run/haikuctl"
+start_precmd="haiku_configtest"
+reload_precmd="haiku_configtest"
+restart_precmd="haiku_configtest"
+configtest_cmd="haiku_configtest"
+pidfile="/var/run/${name}.pid"
+extra_commands="configtest reload"
+
+haiku_configtest()
+{
+	echo "Performing sanity check on ${name} configuration."
+	eval haikucheck
+}
+
+load_rc_config $name
+run_rc_command "$1"

@@ -1,0 +1,24 @@
+Support files for launching haiku from /etc/rc.d/ on FreeBSD
+
+To install haiku on FreeBSD, run the following commands as root inside this directory:
+
+```
+# (Optional) Install build dependencies
+pkg install -y gmake rsync
+
+# Build haiku
+pushd ../..
+./configure
+gmake -j
+gmake install
+popd
+
+# Install haiku as rc.d service. Make sure you are in the containing directory of this README file.
+rsync -r tree/ /
+mkdir -p /etc/haiku.d/boot.d
+
+# enable haiku (to start on next boot)
+/etc/rc.d/haiku enable
+# start haiku now
+/etc/rc.d/haiku start
+```

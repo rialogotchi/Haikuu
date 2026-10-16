@@ -1,0 +1,2610 @@
+#ifndef LOAD_SERVICE_H_INCLUDED
+#define LOAD_SERVICE_H_INCLUDED 1
+
+/*
+ * Functions and definitions related to loading services.
+ *
+ * Some key load functions are declared as inline and are templated allowing to pass in different
+ * functions/functors for actions such as reporting errors. This allows for these load functions
+ * to be used both in haiku and in utilities (haikuctl, haiku-check).
+ *
+ * The key overall function is process_service_file(...) which processes an entire service
+ * description; there is also process_service_line(...) for dealing with invididual lines within a
+ * service description (the latter is called by the former).
+ */
+
+#include <list>
+#include <limits>
+#include <utility>
+#include <vector>
+#include <iterator>
+
+#include <csignal>
+#include <cstring>
+#include <cstdlib>
+
+#include <sys/types.h>
+#include <sys/time.h>
+#include <sys/resource.h>
+#include <grp.h>
+#include <pwd.h>
+
+#include <haiku-env.h>
+#include <haiku-settings.h>
+#include <haiku-utmp.h>
+#include <haiku-util.h>
+#include <haiku-iostream.h>
+#include <file-input-stack.h>
+#include <service-constants.h>
+#include <mconfig.h>
+
+#if SUPPORT_CAPABILITIES
+#include <sys/capability.h>
+#include <linux/securebits.h>
+#endif
+
+#if SUPPORT_IOPRIO
+#include <linux/ioprio.h>
+#endif
+
+// Maximum dependency depth
+constexpr int MAX_DEP_DEPTH = 32;
+
+struct service_flags_t
+{
+    // on-start flags:
+    bool rw_ready : 1;  // file system should be writable once this service starts
+    bool log_ready : 1; // syslog should be available once this service starts
+
+    // Other service options flags:
+    bool runs_on_console : 1;   // run "in the foreground"
+    bool starts_on_console : 1; // starts in the foreground
+    bool shares_console : 1;    // run on console, but not exclusively
+    bool unmask_intr : 1;       // (if runs/starts on console) unmask SIGINTR
+    bool pass_cs_fd : 1;        // pass this service a control socket connection via fd
+    bool start_interruptible : 1; // the startup of this service process is ok to interrupt with SIGINT
+    bool skippable : 1;         // if interrupted the service is skipped (scripted services)
+    bool signal_process_only : 1;  // signal the session process, not the whole group
+    bool always_chain : 1;      // always start chain-to service on exit
+    bool kill_all_on_stop : 1;  // kill all other processes before stopping this service
+    bool no_new_privs : 1;      // set PR_SET_NO_NEW_PRIVS
+
+    service_flags_t() noexcept : rw_ready(false), log_ready(false),
+            runs_on_console(false), starts_on_console(false), shares_console(false),
+            unmask_intr(false), pass_cs_fd(false), start_interruptible(false), skippable(false),
+            signal_process_only(false), always_chain(false), kill_all_on_stop(false),
+            no_new_privs(false)
+    {
+    }
+};
+
+#if SUPPORT_CAPABILITIES
+// A thin wrapper around a "securebits" flags value.
+struct securebits_t
+{
+    unsigned long value = 0;
+
+    securebits_t() noexcept = default;
+
+    void set(unsigned long bits)
+    {
+        value |= bits;
+    }
+
+    void clear() noexcept
+    {
+        value = 0;
+    }
+
+    unsigned long get() const noexcept
+    {
+        return value;
+    }
+};
+#endif
+
+// Resource limits for a particular service & particular resource
+struct service_rlimits
+{
+    int resource_id; // RLIMIT_xxx identifying resource
+    bool soft_set : 1;
+    bool hard_set : 1;
+    struct rlimit limits;
+
+    service_rlimits(int id) : resource_id(id), soft_set(0), hard_set(0), limits({0,0}) { }
+};
+
+// Non-owning file position reference
+class file_pos_ref
+{
+    unsigned line_num;
+    const std::string &file_name;
+    int resolve_dir_fd = -1;
+
+    public:
+    file_pos_ref(file_input_stack &stack)
+        : line_num(stack.current_line()), file_name(stack.current_file_name()),
+          resolve_dir_fd(stack.current_resolve_dir())
+    {
+    }
+
+    file_pos_ref(file_input_stack &stack, unsigned line_num_p)
+        : line_num(line_num_p), file_name(stack.current_file_name()),
+          resolve_dir_fd(stack.current_resolve_dir())
+    {
+    }
+
+    file_pos_ref(const std::string &file_name, unsigned line_num) : line_num(line_num), file_name(file_name)
+    {
+    }
+
+    unsigned get_line_num() const
+    {
+        return line_num;
+    }
+
+    const std::string &get_file_name() const
+    {
+        return file_name;
+    }
+
+    // get reference to (mutable) line number
+    unsigned &get_line_num_ref()
+    {
+        return line_num;
+    }
+
+    int get_resolve_fd()
+    {
+        return resolve_dir_fd;
+    }
+};
+
+// File position
+class file_pos
+{
+    unsigned line_num = -1;
+    std::string file_name;
+
+public:
+    file_pos(const file_pos_ref &fpr)
+        : line_num(fpr.get_line_num()), file_name(fpr.get_file_name())
+    {}
+
+    file_pos(const std::string &file_name, unsigned line_num = -1)
+        : line_num(line_num), file_name(file_name)
+    {}
+
+    file_pos() = default;
+
+    unsigned get_line_num() { return line_num; }
+    const std::string &get_file_name() { return file_name; }
+};
+
+// Service load exceptions.
+
+// Exception while loading a service. This serves as a base for various more specific exceptions
+// and in general should be avoided in favour of those subclasses.
+class service_load_exc
+{
+    public:
+    std::string service_name;
+    std::string exc_description;
+
+    service_load_exc(const std::string &service_name_p, std::string &&desc)
+        : service_name(service_name_p), exc_description(std::move(desc))
+    {
+    }
+
+    protected:
+    service_load_exc(std::string &&desc) : exc_description(std::move(desc))
+    {
+    }
+};
+
+// Service-not-found exception.
+class service_not_found : public service_load_exc
+{
+    public:
+    service_not_found(const std::string &service_name)
+        : service_load_exc(service_name, "service description not found.")
+    {
+    }
+};
+
+// Can't load service due to system error (eg error reading service file)
+class service_load_error : public service_load_exc
+{
+    public:
+    service_load_error(const std::string &service_name, const std::string &path, int fail_errno)
+        : service_load_exc(service_name, path + ": " + strerror(fail_errno))
+    {
+    }
+};
+
+// Cyclic dependency in services.
+class service_cyclic_dependency : public service_load_exc
+{
+    public:
+    service_cyclic_dependency(const std::string &service_name)
+        : service_load_exc(service_name, "has cyclic dependency.")
+    {
+    }
+};
+
+// Error in a service description (or in processing required for a particular setting within).
+// At least one out of line number and setting name will be available. Note that these are often
+// constructed without supplying a service name, with the name filled in later.
+class service_description_exc : public service_load_exc
+{
+    public:
+    file_pos input_pos;
+    const char *const setting_name = nullptr;
+
+    service_description_exc(const file_pos_ref &input_pos_p, std::string &&exc_info)
+            : service_load_exc(std::move(exc_info)), input_pos(input_pos_p)
+    {
+    }
+
+    service_description_exc(const char *setting_name, std::string &&exc_info)
+            : service_load_exc(std::move(exc_info)), setting_name(setting_name)
+    {
+    }
+
+    service_description_exc(const std::string &service_name, std::string &&exc_info,
+            const file_pos_ref &input_pos_p)
+        : service_load_exc(service_name, std::move(exc_info)), input_pos(input_pos_p)
+    {
+    }
+
+    service_description_exc(const std::string &service_name, std::string &&exc_info,
+            const char *setting_name)
+        : service_load_exc(service_name, std::move(exc_info)), setting_name(setting_name)
+    {
+    }
+
+    service_description_exc(const std::string &service_name, std::string &&exc_info,
+            const char *setting_name, const file_pos_ref &input_pos_p)
+        : service_load_exc(service_name, std::move(exc_info)), input_pos(input_pos_p),
+          setting_name(setting_name)
+    {
+    }
+};
+
+namespace haiku_load {
+
+using string = std::string;
+using string_iterator = std::string::iterator;
+
+// Operators in setting lines.
+enum class setting_op_t {
+    ASSIGN /* = */, COLON /* : */, PLUSASSIGN /* += */
+};
+
+// Utility function to skip white space and embedded comments.
+// Parameters:
+//   i, end - input range within a string
+//   count (in/out) - value which is incremented by the number of newlines encountered.
+// Returns:
+//   An iterator at the first non-whitespace, non-comment position (or at end if no such
+//   position).
+inline string_iterator skip_comment(string_iterator i, string_iterator end, unsigned &count) noexcept
+{
+    using std::locale;
+    using std::isspace;
+
+    bool comment = false;
+    while (i != end) {
+        if (*i == '#') {
+            comment = true;
+        }
+        else if (*i == '\n') {
+            ++count;
+            comment = false;
+        }
+
+        if (!comment && !isspace(*i, locale::classic())) break;
+        ++i;
+    }
+
+    return i;
+}
+
+// Utility function to skip white space.
+// Parameters:
+//   i, end - input range within a string
+// Returns:
+//   An iterator at the first non-whitespace position (or at end if no whitespace).
+inline string_iterator skip_ws(string_iterator i, string_iterator end) noexcept
+{
+    using std::locale;
+    using std::isspace;
+
+    while (i != end) {
+        if (!isspace(*i, locale::classic())) {
+            break;
+        }
+        ++i;
+    }
+    return i;
+}
+
+// Utility function to skip white space. This overload accepts pointers rather than iterators.
+// see skip_ws(string_iterator, string_iterator).
+inline const char *skip_ws(const char *i, const char *end) noexcept
+{
+    using std::locale;
+    using std::isspace;
+
+    while (i != end) {
+        if (!isspace(*i, locale::classic())) {
+            break;
+        }
+        ++i;
+    }
+    return i;
+}
+
+// Utility function to skip white space, and count newlines as they are encountered.
+// Parameters:
+//   i, end - input range within a string.
+//   count (in/out) - value which is incremented by the number of newlines encountered.
+// Returns:
+//   An iterator at the first non-whitespace position (or at end if no whitespace).
+inline string_iterator skip_ws_ln(string_iterator i, string_iterator end, unsigned &count) noexcept
+{
+    using std::locale;
+    using std::isspace;
+
+    while (i != end) {
+        if (*i == '\n') ++count;
+        if (!isspace(*i, locale::classic())) {
+            break;
+        }
+        ++i;
+    }
+
+    return i;
+}
+
+// Find whitespace in a string (between two pointers).
+// Parameters:
+//   i, end - the range to look within
+// Returns:
+//   The position of the first whitespace character, or end if none
+inline const char *find_ws(const char *i, const char *end) noexcept
+{
+    using std::locale;
+    using std::isspace;
+
+    while (i != end) {
+        if (isspace(*i, locale::classic())) {
+            break;
+        }
+        ++i;
+    }
+    return i;
+}
+
+// Signal name and number (the std::pair constructor isn't constexpr in C++11, so we use a custom type).
+struct signal_name_number_pair {
+    const char *first; // signal name
+    int second; // number
+};
+
+// Supported signal names and the corresponding signal (number).
+constexpr signal_name_number_pair signal_to_int_map[] = {
+    { "none", 0 },
+    { "NONE", 0 },
+    { "HUP", SIGHUP },
+    { "INT", SIGINT },
+    { "QUIT", SIGQUIT },
+    { "KILL", SIGKILL },
+    { "USR1", SIGUSR1 },
+    { "USR2", SIGUSR2 },
+    { "TERM", SIGTERM },
+    { "CONT", SIGCONT },
+    { "STOP", SIGSTOP },
+#ifdef SIGINFO
+    { "INFO", SIGINFO },
+#endif
+};
+
+// Convert a signal name (without "SIG" prefix) to the corresponding signal number. May only
+// support a subset of signals.
+// Parameters:
+//   signame - the signal name
+// Returns:
+//   The signal number if known; 0 if signal name is "none"/"NONE"; -1 if signal is otherwise
+//   unrecognised.
+inline int signal_name_to_number(const std::string &signame) noexcept
+{
+    int sig = -1;
+    for (const auto &signal: signal_to_int_map) {
+        if (signal.first == signame) {
+            sig = signal.second;
+            break;
+        }
+    }
+    return sig;
+}
+
+// Check whether a string is valid as a service name (possibly including a service argument).
+// Parameters:
+//   name_str - the candidate service name.
+// Returns:
+//   true if the string is a valid service name, false otherwise.
+inline bool validate_service_name(string_view name_str) noexcept
+{
+    // Should not be empty;
+    // Should not start with '.' nor '@';
+    // Should not contain (before '@'): any punctuation other than '.'/'_'/'-'
+
+    if (name_str.empty()) return false;
+    if (name_str[0] == '.') return false;
+    if (name_str[0] == '@') return false;
+
+    return true;
+
+    for (char c : name_str) {
+        if (c == '@') break; // anything can follow '@'
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+                || c == '.' || c == '_' || c == '-') {
+            // ok, allowed character.
+        }
+        else if (c >= 128) {
+            // potentially multi-byte encoded UTF-8 (or other encoding); we don't want to prohibit
+            // typical identifier characters used in a non-english setting, so allow.
+        }
+        else return false;
+    }
+
+    return true;
+}
+
+// Read a setting/variable name; return empty string if no valid name.
+// Parameters:
+//   i (in/out), end - iterator at the beginning of the name and the end of the string
+//         respectively; i is updated to the position just beyond the name on return.
+//   env - if set, dashes/dots are not allowed within names (they are not typically allowed by
+//         shells and they interfere with substitution patterns), and numeric "names" will be
+//         allowed.
+//   num - if specified and not null, the pointee will be set true if the name is numeric, and
+//         set false otherwise.
+// Returns:
+//   The name that was read.
+inline string read_config_name(string_iterator &i, string_iterator end, bool env = false,
+        bool *num = nullptr) noexcept
+{
+    using std::locale;
+    using std::ctype;
+    using std::use_facet;
+
+    // To avoid the horror of locales, we'll use the classic facet only, to identify digits,
+    // control characters and punctuation. (Unless something is totally crazy, we are talking
+    // about ASCII or a superset of it, but using the facet allows us to avoid that assumption).
+    // However, we're only working with "narrow" char type so accuracy is limited. In general,
+    // that's not going to matter much, but may allow certain unicode punctuation characters to be
+    // used as part of a name for example.
+    const ctype<char> & facet = use_facet<ctype<char>>(locale::classic());
+
+    string rval;
+
+    // For environment lookups, integers are valid names (particularly for argument)
+    if (env && facet.is(ctype<char>::digit, *i)) {
+        while (facet.is(ctype<char>::digit, *i)) {
+            rval += *i;
+            ++i;
+        }
+        if (num) {
+            *num = true;
+        }
+        return rval;
+    }
+
+    // Don't allow empty name, numeric digit, or dash/dot at start of setting name
+    if (i == end || (*i == '-' || *i == '.' || facet.is(ctype<char>::digit, *i))) {
+        return {};
+    }
+
+    // Within the setting name, allow dash and dot unless parsing envvar name
+    // also allow any non-control, non-punctuation non-space character.
+    while (i != end && (((*i == '-' || *i == '.') && !env) || *i == '_'
+            || (!facet.is(ctype<char>::cntrl, *i) && !facet.is(ctype<char>::punct, *i)
+                    && !facet.is(ctype<char>::space, *i)))) {
+        rval += *i;
+        ++i;
+    }
+    return rval;
+}
+
+// Read a setting value, with an assignment or plus-assignment (append).
+//
+// In general a setting value is a single-line string. It may contain multiple parts
+// separated by white space (which is normally collapsed). A hash mark - # - denotes
+// the end of the value and the beginning of a comment (it should be preceded by
+// whitespace).
+//
+// Part of a value may be quoted using double quote marks, which prevents collapse
+// of whitespace and interpretation of most special characters (the quote marks will
+// not be considered part of the value). A backslash can precede a character (such
+// as '#' or '"' or another backslash) to remove its special meaning. Newline
+// characters are not allowed in values and cannot be quoted.
+//
+// This function expects the string to be in an ASCII-compatible encoding (the "classic" locale).
+//
+// Throws service_description_exc (with service name unset) on error.
+//
+// Parameters:
+//    setting_val - the (current) setting value, to be modified by the call
+//    operation   - the operation- assign or append
+//    input_pos   - the file and line number on which the setting appears (starts), used for error
+//                  reporting
+//    i           - reference to string iterator through the line (updated to end of setting on
+//                  return)
+//    end         - iterator at end of line (not including newline character if any)
+//    part_positions - list of pair<unsigned,unsigned> to which the position of each setting value
+//                  part will be added as [start,end). May be null.
+// Throws:
+//   service_description_exc, std::bad_alloc, std::length_error
+inline void read_setting_value(std::string &setting_val, setting_op_t operation,
+        file_pos_ref input_pos, string_iterator &i, string_iterator end,
+        std::list<std::pair<unsigned,unsigned>> *part_positions = nullptr,
+        char delimiter = ' ')
+{
+    using std::locale;
+    using std::isspace;
+
+    unsigned &line_num = input_pos.get_line_num_ref();
+
+    i = skip_ws_ln(i, end, line_num);
+
+    if (operation == setting_op_t::PLUSASSIGN) {
+        // Ensure that values are correctly delimited. This is usually only for debugging
+        // niceness as for commands where this is mostly used the offsets actually delimit
+        // the components, but e.g. for capabilities (comma-separated) it matters more.
+        if (!setting_val.empty()) {
+            setting_val += delimiter;
+        }
+    }
+    else {
+        setting_val.clear();
+        if (part_positions != nullptr) {
+            part_positions->clear();
+        }
+    }
+
+    bool new_part = true;
+    int part_start;
+
+    while (i != end) {
+        char c = *i;
+        if (c == '\"') {
+            if (new_part) {
+                part_start = setting_val.length();
+                new_part = false;
+            }
+            // quoted string
+            ++i;
+            while (i != end) {
+                c = *i;
+                if (c == '\"') break;
+                else if (c == '\\') {
+                    // A backslash escapes the following character.
+                    c = *(++i);
+                    setting_val += c;
+                }
+                else {
+                    setting_val += c;
+                }
+                ++i;
+            }
+            if (i == end) {
+                // String wasn't terminated
+                throw service_description_exc(input_pos, "unterminated quoted string");
+            }
+        }
+        else if (c == '\\') {
+            if (new_part) {
+                part_start = setting_val.length();
+                new_part = false;
+            }
+            // A backslash escapes the next character
+            setting_val += *(++i);
+        }
+        else if (isspace(c, locale::classic())) {
+            if (!new_part && part_positions != nullptr) {
+                part_positions->emplace_back(part_start, setting_val.length());
+                new_part = true;
+            }
+            i = skip_comment(i, end, line_num);
+            if (i == end) break;
+            setting_val += ' ';  // collapse ws to a single space
+            continue;
+        }
+        else if (c == '#') {
+            // Possibly intended a comment; we require leading whitespace to reduce occurrence of
+            // accidental comments in setting values.
+            throw service_description_exc(input_pos,
+                    "hashmark (`#') comment must be separated from setting value by whitespace");
+        }
+        else {
+            if (new_part) {
+                part_start = setting_val.length();
+                new_part = false;
+            }
+            setting_val += c;
+        }
+        ++i;
+    }
+
+    // Got to end:
+    if (!new_part && part_positions != nullptr) {
+        part_positions->emplace_back(part_start, setting_val.length());
+    }
+}
+
+// Read a setting value, with an assignment or plus-assignment (append). This overload accepts a
+// ha_string reference for the setting_val argument.
+//
+// See read_setting_value(std::string &, ...)
+inline void read_setting_value(ha_string &setting_val, setting_op_t operation,
+        file_pos_ref input_pos, string_iterator &i, string_iterator end,
+        std::list<std::pair<unsigned,unsigned>> *part_positions = nullptr, char delimiter = ' ') {
+    std::string sval = std::string(setting_val.c_str(), setting_val.length());
+    read_setting_value(sval, operation, input_pos, i, end, part_positions, delimiter);
+    setting_val = sval;
+}
+
+// Read a setting value. This overload assumes an assignment operation, and returns the setting
+// value directly.
+//
+// See read_setting_value(std::string &, ...)
+inline string read_setting_value(file_pos_ref input_pos, string_iterator &i, string_iterator end,
+        std::list<std::pair<unsigned,unsigned>> *part_positions = nullptr)
+{
+    string rval;
+    read_setting_value(rval, setting_op_t::ASSIGN, input_pos, i, end, part_positions);
+    return rval;
+}
+
+// Add a standard set of variables with user-specific values (USER, LOGNAME, HOME, SHELL, UID,
+// GID) to an environment block. The values are derived from the system's user database
+// (getpwuid() function).
+// Parameters:
+//   uid - the user ID to obtain values for
+//   service_name - the name of the service (used for errors)
+//   env - the environment block to add the variables to
+// Throws:
+//   service_load_exc
+inline void fill_environment_userinfo(uid_t uid, const std::string &service_name, environment &env)
+{
+    if (uid == (uid_t)-1) {
+        uid = geteuid();
+    }
+
+    constexpr unsigned max_digits = constexpr_max(type_max_num_digits<uid_t>(),
+            type_max_num_digits<gid_t>());
+    char buf[max_digits + 1]; // +1 for nul terminator
+
+    to_dec_digits(buf, uid);
+
+    errno = 0;
+    struct passwd *pwent = getpwuid(uid);
+
+    if (!pwent) {
+        if (!errno) {
+            throw service_load_exc(service_name, std::string("user id '") + buf
+                    + "' does not exist in system database");
+        }
+        else {
+            throw service_load_exc(service_name, std::string("error accessing user database: ")
+                    + strerror(errno));
+        }
+    }
+
+    std::string enval;
+
+    // USER
+    enval = "USER=";
+    enval += pwent->pw_name;
+    env.set_var(std::move(enval));
+    // LOGNAME
+    enval = "LOGNAME=";
+    enval += pwent->pw_name;
+    env.set_var(std::move(enval));
+    // HOME
+    enval = "HOME=";
+    enval += pwent->pw_dir;
+    env.set_var(std::move(enval));
+    // SHELL
+    enval = "SHELL=";
+    enval += pwent->pw_shell;
+    env.set_var(std::move(enval));
+    // UID (non-standard, but useful)
+    enval = "UID=";
+    to_dec_digits(buf, pwent->pw_uid);
+    enval += buf;
+    env.set_var(std::move(enval));
+    // GID (non-standard, but useful)
+    enval = "GID=";
+    to_dec_digits(buf, pwent->pw_gid);
+    enval += buf;
+    env.set_var(std::move(enval));
+}
+
+// Parse a userid parameter which may be a numeric user ID or a username. If a name, the
+// userid is looked up via the system user database (getpwnam() function).
+// Parameters:
+//   input_pos - input position of the value (used for errors)
+//   param - the parameter value to parse
+//   service_name - the name of the service (used for errors)
+//   setting_name - the setting name (used for errors)
+//   group_p (out ptr) - if not null and a username was supplied (as opposed to a numeric ID), the
+//       primary group of the user will be stored through
+// Returns:
+//   The ID (uid_t) of the specified user
+// Throws:
+//   service_description_exc
+inline uid_t parse_uid_param(file_pos_ref input_pos, const std::string &param,
+        const std::string &service_name, const char *setting_name, gid_t *group_p)
+{
+    const char *uid_err_msg = "specified user id contains invalid numeric characters "
+            "or is outside allowed range.";
+
+    // Could be a name or a numeric id. But we should assume numeric first, just in case
+    // a user manages to give themselves a username that parses as a number.
+    std::size_t ind = 0;
+    try {
+        // POSIX does not specify whether uid_t is a signed or unsigned type, but regardless
+        // is is probably safe to assume that valid values are positive. We'll also assert
+        // that the value range fits within "unsigned long long" since it seems unlikely
+        // that would ever not be the case.
+        static_assert((uintmax_t)std::numeric_limits<uid_t>::max()
+                <= (uintmax_t)std::numeric_limits<unsigned long long>::max(), "uid_t is too large");
+        unsigned long long v = std::stoull(param, &ind, 0);
+        if (v > static_cast<unsigned long long>(std::numeric_limits<uid_t>::max())
+                || ind != param.length()) {
+            throw service_description_exc(service_name, std::string(setting_name) + ": "
+                    + uid_err_msg, input_pos);
+        }
+        return v;
+    }
+    catch (std::out_of_range &exc) {
+        throw service_description_exc(service_name, uid_err_msg, input_pos);
+    }
+    catch (std::invalid_argument &exc) {
+        // Ok, so it doesn't look like a number: proceed...
+    }
+
+    errno = 0;
+    struct passwd *pwent = getpwnam(param.c_str());
+    if (pwent == nullptr) {
+        // Maybe an error, maybe just no entry.
+        if (errno == 0) {
+            throw service_description_exc(service_name,
+                    std::string(setting_name) + ": specified user \"" + param
+                    + "\" does not exist in system database.", input_pos);
+        }
+        else {
+            throw service_description_exc(service_name, std::string("error accessing user database: ")
+                    + strerror(errno), input_pos);
+        }
+    }
+
+    if (group_p) {
+        *group_p = pwent->pw_gid;
+    }
+
+    return pwent->pw_uid;
+}
+
+// Parse a group name or numeric id.
+// Parameters:
+//   input_pos - input position of the value (used for errors)
+//   param - the parameter value to parse
+//   service_name - the name of the service (used for errors)
+//   setting_name - the setting name (used for errors)
+// Returns:
+//   The group ID (gid_t) as specified or looked up by name
+// Throws:
+//   service_description_exc
+inline gid_t parse_gid_param(file_pos_ref input_pos, const std::string &param,
+        ::string_view service_name, const char *setting_name)
+{
+    const char *gid_err_msg = "specified group id contains invalid numeric characters or is "
+            "outside allowed range.";
+
+    // Could be a name or a numeric id. But we should assume numeric first, just in case
+    // a user manages to give themselves a username that parses as a number.
+    std::size_t ind = 0;
+    try {
+        // POSIX does not specify whether uid_t is an signed or unsigned, but regardless
+        // is is probably safe to assume that valid values are positive.
+        static_assert((uintmax_t)std::numeric_limits<gid_t>::max()
+                <= (uintmax_t)std::numeric_limits<unsigned long long>::max(), "gid_t is too large");
+        unsigned long long v = std::stoull(param, &ind, 0);
+        if (v > static_cast<unsigned long long>(std::numeric_limits<gid_t>::max())
+                || ind != param.length()) {
+            throw service_description_exc(service_name, std::string(setting_name) + ": " + gid_err_msg,
+                    input_pos);
+        }
+        return v;
+    }
+    catch (std::out_of_range &exc) {
+        throw service_description_exc(service_name, std::string(setting_name) + ": " + gid_err_msg,
+                input_pos);
+    }
+    catch (std::invalid_argument &exc) {
+        // Ok, so it doesn't look like a number: proceed...
+    }
+
+    errno = 0;
+    struct group *grent = getgrnam(param.c_str());
+    if (grent == nullptr) {
+        // Maybe an error, maybe just no entry.
+        if (errno == 0) {
+            throw service_description_exc(service_name, std::string(setting_name) + ": specified group \""
+                    + param + "\" does not exist in system database.", input_pos);
+        }
+        else {
+            throw service_description_exc(service_name, std::string("error accessing group database: ")
+                    + strerror(errno), input_pos);
+        }
+    }
+
+    return grent->gr_gid;
+}
+
+// Parse a permissions mask parameter value, specified as an octal (such as 0600)
+// Parameters:
+//   input_pos - input position of the value (used for errors)
+//   paramval - the parameter value to parse
+//   service_name - the name of the service (used for errors)
+//   setting_name - the setting name (used for errors)
+// Returns:
+//   The parsed value as an integer
+// Throws:
+//   service_description_exc
+inline int parse_perms(file_pos_ref input_pos, string &paramval, const std::string &service_name,
+        const char *setting_name)
+{
+    std::size_t ind = 0;
+    try {
+        int perms = std::stoi(paramval, &ind, 8);
+        if (ind != paramval.length()) {
+            throw std::logic_error("");
+        }
+        return perms;
+    }
+    catch (std::logic_error &exc) {
+        throw service_description_exc(service_name, setting_name,
+                "badly-formed or out-of-range numeric value", input_pos);
+    }
+}
+
+// Parse a time, specified as a decimal number of seconds (with optional fractional component after decimal
+// point or decimal comma).
+// Parameters:
+//   input_pos - input position of the value (used for errors)
+//   paramval - the parameter value to parse
+//   service_name - the name of the service (used for errors)
+//   paramname - the setting name (used for errors)
+//   ts (out) - the parsed time.
+// Throws:
+//   service_description_exc
+inline void parse_timespec(file_pos_ref input_pos, const std::string &paramval,
+        const std::string &servicename, const char *paramname, timespec &ts)
+{
+    decltype(ts.tv_sec) isec = 0;
+    decltype(ts.tv_nsec) insec = 0;
+    auto max_secs = std::numeric_limits<decltype(isec)>::max() / 10;
+    auto len = paramval.length();
+    decltype(len) i;
+    for (i = 0; i < len; i++) {
+        char ch = paramval[i];
+        if (ch == '.' || ch == ',') {
+            i++;
+            break;
+        }
+        if (ch < '0' || ch > '9') {
+            throw service_description_exc(servicename, std::string("bad value for ") + paramname,
+                    input_pos);
+        }
+        // check for overflow
+        if (isec >= max_secs) {
+           throw service_description_exc(servicename,
+                   std::string("too-large value for ") + paramname, input_pos);
+        }
+        isec *= 10;
+        isec += ch - '0';
+    }
+    decltype(insec) insec_m = 100000000; // 10^8
+    for ( ; i < len; i++) {
+        char ch = paramval[i];
+        if (ch < '0' || ch > '9') {
+            throw service_description_exc(servicename, std::string("bad value for ") + paramname,
+                    input_pos);
+        }
+        insec += (ch - '0') * insec_m;
+        insec_m /= 10;
+    }
+    ts.tv_sec = isec;
+    ts.tv_nsec = insec;
+}
+
+// Parse an unsigned numeric parameter value.
+// Parameters:
+//   input_pos - input position of the value (used for errors)
+//   param - the parameter value to parse
+//   service_name - the name of the service (used for errors)
+//   max - the maximum allowed value (optional)
+// Returns:
+//   The value parsed from the setting string.
+// Throws:
+//   service_description_exc
+inline unsigned long long parse_unum_param(file_pos_ref input_pos, const std::string &param,
+        const std::string &service_name,
+        unsigned long long max = std::numeric_limits<unsigned long long>::max())
+{
+    const char *num_err_msg = "specified value contains invalid numeric characters or is outside "
+            "allowed range.";
+
+    std::size_t ind = 0;
+    try {
+        unsigned long long v = std::stoull(param, &ind, 0);
+        if (v > max || ind != param.length()) {
+            throw service_description_exc(service_name, num_err_msg, input_pos);
+        }
+        return v;
+    }
+    catch (std::out_of_range &exc) {
+        throw service_description_exc(service_name, num_err_msg, input_pos);
+    }
+    catch (std::invalid_argument &exc) {
+        throw service_description_exc(service_name, num_err_msg, input_pos);
+    }
+}
+
+// Parse a signed numeric setting value.
+// Parameters:
+//   input_pos - input position of the value (used for errors)
+//   param - the parameter value to parse
+//   service_name - the name of the service (used for errors)
+//   min - the minimum allowed value (optional)
+//   max - the maximum allowed value (optional)
+// Returns:
+//   The value parsed from the setting string.
+// Throws:
+//   service_description_exc
+inline long long parse_snum_param(file_pos_ref input_pos, const std::string &param,
+        const std::string &service_name, long long min = std::numeric_limits<long long>::min(),
+        long long max = std::numeric_limits<long long>::max())
+{
+    const char *num_err_msg = "specified value contains invalid numeric characters or is outside "
+            "allowed range.";
+
+    std::size_t ind = 0;
+    try {
+        long long v = std::stoll(param, &ind, 0);
+        if (v < min || v > max || ind != param.length()) {
+            throw service_description_exc(service_name, num_err_msg, input_pos);
+        }
+        return v;
+    }
+    catch (std::out_of_range &exc) {
+        throw service_description_exc(service_name, num_err_msg, input_pos);
+    }
+    catch (std::invalid_argument &exc) {
+        throw service_description_exc(service_name, num_err_msg, input_pos);
+    }
+}
+
+// In a vector, find or create rlimits for a particular resource type.
+// Parameters:
+//   all_rlimits - a vector containing limits for different resources
+//   resource_id - the id of the resource find/create an entry for
+// Returns:
+//   A reference to the rlimits for the specified resource type
+// Throws:
+//   std::bad_alloc
+inline service_rlimits &find_rlimits(std::vector<service_rlimits> &all_rlimits, int resource_id)
+{
+    for (service_rlimits &limits : all_rlimits) {
+        if (limits.resource_id == resource_id) {
+            return limits;
+        }
+    }
+
+    all_rlimits.emplace_back(resource_id);
+    return all_rlimits.back();
+}
+
+// Parse resource limits setting (can specify both hard and soft limit).
+// Parameters:
+//   line - the resource limits setting value
+//   input_pos - the input position where the setting was found (used for errors)
+//   service_name - the name of the service (used for errors)
+//   param_name - the name of the setting (used for errors)
+//   rlimit - (out parameter) receives the parsed limits
+// Throws:
+//   service_description_exc
+inline void parse_rlimit(const std::string &line, file_pos_ref input_pos,
+        const std::string &service_name, const char *param_name, service_rlimits &rlimit)
+{
+    // Examples:
+    // 4:5 - soft:hard limits both set
+    // 4:-   soft set, hard set to unlimited
+    // 4:    soft set, hard limit unchanged
+    // 4     soft and hard limit set to same limit
+
+    if (line.empty()) {
+        throw service_description_exc(service_name, std::string(param_name) + ": bad value.", input_pos);
+    }
+
+    const char *cline = line.c_str();
+    rlimit.hard_set = rlimit.soft_set = false;
+
+    try {
+        const char *index = cline;
+        errno = 0;
+        if (cline[0] != ':') {
+            rlimit.soft_set = true;
+            if (cline[0] == '-') {
+                rlimit.limits.rlim_cur = RLIM_INFINITY;
+                index = cline + 1;
+            }
+            else {
+                errno = 0;
+                char *nindex;
+                unsigned long long limit = std::strtoull(cline, &nindex, 0);
+                index = nindex;
+                if (errno == ERANGE || limit > std::numeric_limits<rlim_t>::max()) {
+                    throw std::out_of_range("");
+                }
+                if (index == cline) throw std::invalid_argument("");
+                rlimit.limits.rlim_cur = limit;
+            }
+
+            if (*index == 0) {
+                rlimit.hard_set = true;
+                rlimit.limits.rlim_max = rlimit.limits.rlim_cur;
+                return;
+            }
+
+            if (*index != ':') {
+                throw service_description_exc(service_name,
+                        std::string(param_name) + ": bad value.", input_pos);
+            }
+        }
+
+        index++;
+        if (*index == 0) return;
+
+        rlimit.hard_set = true;
+
+        if (*index == '-') {
+            rlimit.limits.rlim_max = RLIM_INFINITY;
+            if (index[1] != 0) {
+                throw service_description_exc(service_name,
+                        std::string(param_name) + ": bad value.", input_pos);
+            }
+        }
+        else {
+            const char *hard_start = index;
+            char *nindex;
+            errno = 0;
+            unsigned long long limit = std::strtoull(hard_start, &nindex, 0);
+            index = nindex;
+            if (errno == ERANGE || limit > std::numeric_limits<rlim_t>::max()) throw std::out_of_range("");
+            if (index == hard_start) throw std::invalid_argument("");
+            rlimit.limits.rlim_max = limit;
+        }
+    }
+    catch (std::invalid_argument &exc) {
+        throw service_description_exc(service_name, std::string(param_name) + ": bad value.", input_pos);
+    }
+    catch (std::out_of_range &exc) {
+        throw service_description_exc(service_name, std::string(param_name) + ": too-large value.",
+                input_pos);
+    }
+}
+
+// forward declaration:
+template <typename resolve_var_t>
+inline string read_include_path(string const &meta_cmd, file_pos_ref input_pos,
+        string_iterator &i, string_iterator end, const char *argval,
+        const resolve_var_t &resolve_var);
+
+// (Dummy function for default argument to process_service_file)
+inline void null_process_meta(string::iterator begin, string::iterator end) {}
+
+// Process an opened service file, line by line.
+// Parameters:
+//   name - the service name
+//   service_input - the service file input stream (stack)
+//   process_line_func - a function to process settings, of the form:
+//             void(string &line, file_pos_ref position, string &setting, string_iterator i,
+//                     string_iterator end)
+//           Called with:
+//               line - the complete line, excluding newline character
+//               position - the input position (file_pos_ref)
+//               setting - the setting name, from the beginning of the line
+//               op - the operation (setting_op_t)
+//               i - iterator at the beginning of the setting value
+//               end - iterator marking the end of the line
+//   argval - the service argument, or nullptr if none
+//   resolve_var - a functor to resolve variable values.
+//       Accepts: const std::string & - the variable name.
+//       Returns char * - the resolved value.
+//   process_meta - a functor to process '@meta' commands
+//       Accepts: string::iterator i - beginning of command (following '@meta')
+//                string::iterator e - end of line
+//       Returns: void.
+// Throws:
+//   service_load_exc, dio::iostream_system_err, and subclasses; also propagates exceptions thrown
+//   from process_line_func, resolve_var, and process_meta.
+template <typename T, typename resolve_var_t,
+        typename process_meta_t = decltype(null_process_meta)>
+void process_service_file(string name, file_input_stack &service_input, T process_line_func,
+        const char *argval, const resolve_var_t &resolve_var,
+        const process_meta_t &process_meta = null_process_meta)
+{
+    string line;
+
+    while (service_input.getline(line)) {
+
+        unsigned line_num = service_input.current_line();
+
+        if (line.empty()) continue;
+        while (line.back() == '\\') {
+            // Check for double-backslash, i.e. backslash escaped with backslash. We actually need
+            // to check for any even number.
+            bool is_odd_number = true;
+            auto r = std::next(line.rbegin());
+            auto re = line.rend();
+            while (r != re) {
+                if (*r != '\\') break;
+                is_odd_number = !is_odd_number;
+                ++r;
+            }
+
+            if (!is_odd_number) break;
+
+            string nextline;
+            string::iterator j;
+            string::iterator endnext;
+
+            line.back() = '\n';
+            if (!service_input.getline_same_file(nextline)) {
+                throw service_description_exc(service_input,
+                        "end-of-file follows backslash escape character (`\\')");
+            }
+
+            j = nextline.begin();
+            endnext = nextline.end();
+            j = skip_ws(j, endnext);
+            if (j == nextline.begin()) {
+                throw service_description_exc(service_input,
+                        "line following line-continuation backslash (`\\') "
+                        "does not begin with whitespace character");
+            }
+            line.append(nextline);
+        }
+
+        string::iterator i = line.begin();
+        string::iterator end = line.end();
+
+        i = skip_ws_ln(i, end, line_num);
+        if (i != end) {
+            if (*i == '#') continue; // comment without setting
+
+            if (*i == '@') {
+                // "@" prefix: either a meta command (@include, @include-opt, @meta) or an
+                // "@setting = value" line (Haiku style). Peek at the name to decide.
+                auto peek = i;
+                ++peek;
+                string peek_name = read_config_name(peek, end);
+                if (peek_name != "include" && peek_name != "include-opt" && peek_name != "meta") {
+                    ++i; // strip '@', parse as ordinary setting below
+                }
+            }
+
+            if (*i == '@') {
+                // meta command
+                ++i;
+                string meta_cmd = read_config_name(i, end);
+                bool is_include_opt = (meta_cmd == "include-opt");
+                if (is_include_opt || meta_cmd == "include") {
+                    // @include-opt or @include
+                    file_pos_ref input_pos { service_input.current_file_name(), line_num };
+                    std::string include_name = read_include_path(meta_cmd, input_pos, i, end,
+                            argval, resolve_var);
+
+                    const char *include_name_base = base_name(include_name.c_str());
+                    const char *include_name_dir;
+                    size_t nul_pos = std::string::npos;
+                    if (include_name_base == include_name.c_str()) {
+                        include_name_dir = "";
+                    }
+                    else if (include_name_base == (include_name.c_str() + 1)) {
+                        // Parent path must be '/' but we may not have space to insert a nul
+                        include_name_dir = "/";
+                    }
+                    else {
+                        include_name_dir = include_name.c_str();
+                        // We insert a nul between the include file path name and base name,
+                        // temporarily, so we can pass both separately to open_with_dir (below);
+                        // we need to restore it to a separator ('/') just after.
+                        nul_pos = include_name_base - include_name_dir - 1;
+                        include_name[nul_pos] = '\0';
+                    }
+
+                    auto inc_sdf_fds = open_with_dir(include_name_dir, include_name_base,
+                            service_input.current_resolve_dir());
+
+                    if (nul_pos != std::string::npos) {
+                        // Need to restore the separator between path and base name
+                        include_name[nul_pos] = '/';
+                    }
+
+                    if (inc_sdf_fds.first == -1) {
+                        if (!is_include_opt || inc_sdf_fds.second != ENOENT) {
+                            throw service_load_exc(name, include_name + ": cannot open: "
+                                    + strerror(inc_sdf_fds.second));
+                        }
+                    }
+                    else {
+                        dio::istream file(inc_sdf_fds.second);
+                        service_input.push(include_name, std::move(file), inc_sdf_fds.first);
+                    }
+                }
+                else if (meta_cmd == "meta") {
+                    // @meta can be used to add information for other tools; ignore
+                    process_meta(i, end);
+                }
+                else {
+                    file_pos_ref input_pos { service_input.current_file_name(), line_num };
+                    throw service_description_exc(name, "bad meta command", input_pos);
+                }
+
+                continue;
+            }
+
+            string setting = read_config_name(i, end);
+            i = skip_ws_ln(i, end, line_num);
+
+            setting_op_t setting_op;
+
+            bool bad_line = false;
+            if (setting.empty()) {
+                bad_line = true;
+            }
+            else if (*i == '=') {
+                setting_op = setting_op_t::ASSIGN;
+            }
+            else if (*i == ':') {
+                setting_op = setting_op_t::COLON;
+            }
+            else if (*i == '+') {
+                ++i;
+                if (i != end && *i == '=') {
+                    // "+=" is allowed
+                    setting_op = setting_op_t::PLUSASSIGN;
+                }
+                else {
+                    bad_line = true;
+                }
+            }
+            else {
+                bad_line = true;
+            }
+
+            if (bad_line) {
+                throw service_description_exc(name, "badly formed line.", service_input);
+            }
+
+            i = skip_ws_ln(++i, end, line_num);
+
+            file_pos_ref fpr { service_input, line_num };
+            process_line_func(line, fpr, setting, setting_op, i, end);
+        }
+    }
+}
+
+// A dummy lint-reporting function.
+inline void dummy_lint(const char *) {}
+
+// Resolve variables from an environment
+inline const char *resolve_env_var(const string &name, const environment::env_map &envmap)
+{
+    return envmap.lookup(name);
+};
+
+// A dummy variable resolution function (for use with process_service_line).
+inline const char *null_resolve_env_var(const string &name)
+{
+    return nullptr;
+}
+
+// Substitute variable references in a value with their values. Specified offsets must give
+// the location of separate arguments after word splitting and are adjusted appropriately.
+// If you simply wish to substitute all variables in the given string, pass an offsets list
+// containing one pair with the string's bounds (0, size). '$$' resolves to a single '$'.
+// Parameters:
+//   setting_name - the name of the setting from which the value comes (used for errors)
+//   line (by ref.) - the complete setting value line (on call), with variable references
+//                    replaced on return.
+//   offsets (by ref.) - the position as [start,end) for each token in the line (must be
+//                    valid on call, is updated on return).
+//   var_resolve - a functor to resolve variable values.
+//       Accepts: const std::string & - the variable name.
+//       Returns char * - the resolved value.
+//   argval - the service argument value, if any (nullptr if none).
+// Throws:
+//   service_description_exc - if a $-substitution is ill-formed
+//   std::length_error - if string length limit exceeded or command line is too long
+//   std::bad_alloc - on allocation failure
+template <typename T>
+static void value_var_subst(const char *setting_name, std::string &line,
+        std::list<std::pair<unsigned,unsigned>> &offsets, const T &var_resolve, const char *argval)
+{
+    auto dindx = line.find('$');
+    if (dindx == string::npos) {
+        return;
+    }
+
+    if (line.length() > (size_t)std::numeric_limits<int>::max()) {
+        // (avoid potential for overflow later)
+        throw std::length_error("string too long");
+    }
+
+    auto i = offsets.begin();
+    unsigned xpos = 0; // position to copy from in original line
+    std::string r_line;
+    int offadj = 0;
+
+    while (i != offsets.end()) {
+
+        i->first += offadj; // don't adjust end yet
+
+        // inhibit_collapse is set if we process anything which may be empty but shouldn't collapse
+        // to "no argument"
+        bool inhibit_collapse = false;
+        bool do_collapse = false;
+
+        while (i->second > dindx) {
+            r_line.append(line, xpos, dindx - xpos); // copy unmatched part
+            if (line[dindx + 1] == '$') {
+                // double dollar, collapse to single
+                r_line += '$';
+                xpos = dindx + 2;
+                --offadj;
+            }
+            else {
+                // variable
+                auto token_end = std::next(line.begin(), i->second);
+                auto spos = dindx + 1;
+                bool wsplit = line[spos] == '/';
+                if (wsplit) ++spos;
+                bool brace = line[spos] == '{';
+                if (brace) ++spos;
+                auto j = std::next(line.begin(), spos);
+                // may be a service argument
+                bool is_arg = false;
+                // read environment variable name
+                string name = read_config_name(j, token_end, true, &is_arg);
+                if (name.empty()) {
+                    throw service_description_exc(setting_name, "invalid/missing variable name after '$'");
+                }
+                else if (is_arg && name != "1") {
+                    // only one arg is supported
+                    throw service_description_exc(setting_name, "only one service argument may be present");
+                }
+                char altmode = '\0';
+                bool colon = false;
+                auto altbeg = j, altend = j;
+                if (brace) {
+                    /* ${foo+val}, ${foo-val}, ${foo:+val}, ${foo:-val} */
+                    if (*j == ':') {
+                        colon = true;
+                        ++j;
+                        if (*j != '+' && *j != '-') {
+                            throw service_description_exc(setting_name,
+                                    "invalid syntax in variable substitution");
+                        }
+                    }
+                    if (*j == '+' || *j == '-') {
+                        altmode = *j;
+                        altbeg = ++j;
+                        while (j != token_end && *j != '}') {
+                            ++j;
+                        }
+                        altend = j;
+                    }
+                    if (*j != '}') {
+                        throw service_description_exc(setting_name,
+                                "unmatched '{' in variable substitution");
+                    }
+                    ++j;
+                }
+                size_t line_len_before = r_line.size();
+                string_view resolved_vw;
+                auto *resolved = is_arg ? argval : var_resolve(name);
+                if (resolved) {
+                    resolved_vw = resolved;
+                }
+                /* apply shell-like substitutions */
+                if (altmode == '-') {
+                    if (!resolved || (colon && !*resolved)) {
+                        resolved_vw = {line.c_str() + (altbeg - line.begin()), (size_t)(altend - altbeg)};
+                    }
+                }
+                else if (altmode == '+') {
+                    if (resolved && (!colon || *resolved)) {
+                        resolved_vw = {line.c_str() + (altbeg - line.begin()), (size_t)(altend - altbeg)};
+                    }
+                }
+                else if (is_arg && !argval) {
+                    // $1 and ${1} is special in that it must be set or it is an error
+                    // however, we want the more complex syntaxes for conditional substitution
+                    throw service_description_exc(setting_name, "missing value in argument substitution");
+                }
+
+                xpos = j - line.begin();
+                int name_len = xpos - dindx;
+                offadj -= name_len;
+
+                if (!wsplit) {
+                    inhibit_collapse = true;
+                    do_collapse = false;
+                    if (!resolved_vw.empty()) {
+                        r_line.append(resolved_vw.data(), resolved_vw.length());
+                    }
+                }
+                else {
+                    // Must perform word splitting. Find first whitespace:
+                    auto r_vw_beg = resolved_vw.data();
+                    auto r_vw_end = r_vw_beg + resolved_vw.length();
+                    const char *wsp = find_ws(r_vw_beg, r_vw_end);
+
+                    // If we have whitespace, append up to that whitespace and then split:
+                    while (wsp != r_vw_end) {
+                        if (wsp != r_vw_beg) {
+                            r_line.append(r_vw_beg, wsp - r_vw_beg);
+                        }
+
+                        auto orig_i_second = i->second;
+
+                        size_t line_len_after = r_line.size();
+                        if (i->first == line_len_after && !inhibit_collapse) {
+                            // whitespace at the start of the word; just trim it
+                            goto next_section;
+                        }
+
+                        // Break here:
+                        i->second = r_line.length();
+
+                        r_line += ' ';
+                        ++line_len_after;
+
+                        if (line_len_after > (size_t)std::numeric_limits<int>::max()) {
+                            // (avoid potential overflow)
+                            throw service_description_exc(setting_name,
+                                    "value too long (after substitution)");
+                        }
+
+                        // Create new argument from split:
+                        i = offsets.insert(std::next(i), {r_line.length(), orig_i_second});
+                        offadj += (int)line_len_after - (int)line_len_before;
+                        line_len_before = r_line.size();
+
+                        // Find the next break, if any:
+                        next_section:
+                        r_vw_beg = skip_ws(wsp, r_vw_end);
+                        wsp = find_ws(r_vw_beg, r_vw_end);
+                        inhibit_collapse = false;
+                    }
+
+                    if (r_vw_beg != r_vw_end) {
+                        r_line.append(r_vw_beg, r_vw_end - r_vw_beg);
+                    }
+
+                    do_collapse = !inhibit_collapse;
+                }
+
+                size_t line_len_after = r_line.size();
+
+                if (line_len_after > (size_t)std::numeric_limits<int>::max()) {
+                    // (avoid potential overflow)
+                    throw service_description_exc(setting_name, "value too long (after substitution)");
+                }
+
+                offadj += (int)line_len_after - (int)line_len_before;
+            }
+
+            dindx = line.find('$', xpos);
+        }
+
+        i->second += offadj;
+
+        if (do_collapse && i->first == i->second) {
+            i = offsets.erase(i);
+        }
+        else {
+            ++i;
+        }
+
+        while (i != offsets.end() && i->second < dindx) {
+            i->first += offadj;
+            i->second += offadj;
+            ++i;
+        }
+    }
+
+    r_line.append(line, xpos); // copy final unmatched part
+    line = std::move(r_line);
+}
+
+// Substitute variable references in a value with their values. See value_var_subst above. This
+// variant supports lookup of variable values via an environment::env_map instance.
+// Parameters:
+//   setting_name - the name of the setting from which the value comes (used for errors)
+//   line (by ref.) - the complete setting value line (on call), with variable references
+//                    replaced on return.
+//   offsets (by ref.) - the position as [start,end) for each token in the line (must be
+//                    valid on call, is updated on return).
+//   envmap - the environment to look up variable values from
+//   argval - the service argument value, if any (nullptr if none).
+// Throws:
+//   service_description_exc - if a $-substitution is ill-formed
+//   std::length_error - if string length limit exceeded or command line is too long
+//   std::bad_alloc - on allocation failure
+template <typename T>
+static void value_var_subst(const char *setting_name, std::string &line,
+        std::list<std::pair<unsigned,unsigned>> &offsets, const environment::env_map &envmap,
+        const char *argval)
+{
+    auto var_lookup = [&](const std::string &name) {
+        return envmap.lookup(name);
+    };
+
+    value_var_subst(setting_name, line, offsets, var_lookup, argval);
+}
+
+// Reads a value while performing pre-load variable expansion (including argument expansion) in
+// it.
+// Parameters:
+//   setting_name - the name of the setting which the value is for; may be stored in exceptions
+//                  (so must have a suitable lifetime, generally should be a string constant).
+//   input_pos - the input position, used for error reporting (exceptions)
+//   i - iterator at beginning of value string (will be updated to end of setting value)
+//   end - iterator at end of value string
+//   argval - value of the service argument if any (or null otherwise)
+//   resolve_var - function to resolve named variables
+// Returns:
+//   The setting value after resolution.
+// Throws:
+//   service_description_exc (with service name unset) - for a syntax error in the setting value.
+//   May also propagate any exception thrown by resolve_var.
+template <typename resolve_var_t>
+inline string read_value_resolved(const char *setting_name, file_pos_ref input_pos, string_iterator &i,
+        string_iterator end, const char *argval, const resolve_var_t &resolve_var)
+{
+    string rval;
+    read_setting_value(rval, setting_op_t::ASSIGN, input_pos, i, end, nullptr);
+
+    std::list<std::pair<unsigned,unsigned>> offsets;
+    offsets.emplace_back(0, rval.size());
+    value_var_subst(setting_name, rval, offsets, resolve_var, argval);
+    return rval;
+}
+
+// Reads an include path (expected as argument to a meta-command such as '@include') while
+// performing pre-load variable expansion.
+// Parameters:
+//   meta_cmd - the meta-command which the argument is for (used for error messages/exceptions)
+//   input_pos - the current input position (used for error messages/exceptions)
+//   i - the iterator at the beginning of the argument(s)
+//   end - iterator at end of argument string
+//   argval - the value of the service argument if any (or null otherwise)
+//   resolve_var - function to resolve named variables
+// Throws:
+//   service_description_exc (with service name unset) - for a syntax error in the setting value.
+//   May also propagate any exception thrown by resolve_var.
+template <typename resolve_var_t>
+inline string read_include_path(string const &meta_cmd, file_pos_ref input_pos,
+        string_iterator &i, string_iterator end, const char *argval,  const resolve_var_t &resolve_var)
+{
+    string rval;
+    std::list<std::pair<unsigned,unsigned>> parts;
+
+    read_setting_value(rval, setting_op_t::ASSIGN, input_pos, i, end, &parts);
+    if (parts.size() != 1) {
+        throw service_description_exc(input_pos, "'@" + meta_cmd + "' requires a single argument");
+    }
+
+    std::list<std::pair<unsigned,unsigned>> offsets;
+    offsets.emplace_back(0, rval.size());
+    value_var_subst(meta_cmd.c_str(), rval, offsets, resolve_var, argval);
+    return rval;
+}
+
+// A wrapper type for service parameters. It is parameterised by dependency type.
+template <class dep_type>
+class service_settings_wrapper
+{
+    template <typename A, typename B> using pair = std::pair<A,B>;
+    template <typename A> using list = std::list<A>;
+
+    public:
+
+    ha_string command;
+    list<pair<unsigned,unsigned>> command_offsets; // [start,end) offset of each arg (inc. executable)
+    ha_string stop_command;
+    list<pair<unsigned,unsigned>> stop_command_offsets;
+    string working_dir;
+    string pid_file;
+    string env_file;
+
+    // file descriptor to resolve env_file against (if it is relative).
+    fd_holder env_file_dir_fd;
+
+    bool export_passwd_vars = false;
+    bool export_service_name = false;
+
+    service_type_t service_type = service_type_t::INTERNAL;
+    list<dep_type> depends;
+    list<std::string> before_svcs;
+    list<std::string> after_svcs;
+    log_type_id log_type = log_type_id::NONE;
+    string logfile;
+    int logfile_perms = 0600;
+    uid_t logfile_uid = -1;
+    gid_t logfile_uid_gid = -1; // Primary group of logfile owner if known
+    gid_t logfile_gid = -1;
+    unsigned max_log_buffer_sz = 4096;
+    service_flags_t onstart_flags;
+    int term_signal = SIGTERM;  // termination signal
+    auto_restart_mode auto_restart = auto_restart_mode::DEFAULT_AUTO_RESTART;
+    bool smooth_recovery = false;
+    string socket_path;
+    int socket_perms = 0666;
+    // Note: Posix allows that uid_t and gid_t may be unsigned types, but eg chown uses -1 as an
+    // invalid value, so it's safe to assume that we can do the same:
+    uid_t socket_uid = -1;
+    gid_t socket_uid_gid = -1;  // primary group of socket user if known
+    gid_t socket_gid = -1;
+    // Restart limit interval / count; default is 10 seconds, 3 restarts:
+    timespec restart_interval = { .tv_sec = 10, .tv_nsec = 0 };
+    int max_restarts = 3;
+    timespec restart_delay = { .tv_sec = 0, .tv_nsec = 200000000 };
+    timespec stop_timeout = { .tv_sec = DEFAULT_STOP_TIMEOUT, .tv_nsec = 0 };
+    timespec start_timeout = { .tv_sec = DEFAULT_START_TIMEOUT, .tv_nsec = 0 };
+    std::vector<service_rlimits> rlimits;
+
+    int readiness_fd = -1;      // readiness fd in service process
+    string readiness_var;  // environment var to hold readiness fd
+
+    uid_t run_as_uid = -1;
+    gid_t run_as_uid_gid = -1; // primary group of "run as" uid if known
+    gid_t run_as_gid = -1;
+
+    bool nice_is_set = false;
+    int nice;
+
+    string chain_to_name;
+    string consumer_of_name;
+
+    #if SUPPORT_CGROUPS
+    string run_in_cgroup;
+    #endif
+
+    #if SUPPORT_CAPABILITIES
+    cap_iab_wrapper capabilities;
+    securebits_t secbits;
+    #endif
+
+    #if SUPPORT_IOPRIO
+    // The ioprio value, as passed to ioprio_set(...). An ioprio of -1 is invalid (it is returned
+    // by ioprio_get() to indicate an error). A value of 0 specifies the default behaviour (I/O
+    // priority determined by CPU "nice" value).
+    int ioprio = -1;
+    #endif
+
+    #if SUPPORT_OOM_ADJ
+    bool oom_adj_is_set = false;
+    short oom_adj = 0;
+    #endif
+
+    #if USE_UTMPX
+    char inittab_id[sizeof(utmpx().ut_id)] = {0};
+    char inittab_line[sizeof(utmpx().ut_line)] = {0};
+    #endif
+
+    // Finalise settings (after processing all setting lines), perform some basic sanity checks
+    // and optionally some additional lint checks.
+    // Template parameters:
+    //   propagate_sde - whether to propagate service description errors (if false, they are
+    //                   reported via report_err)
+    //   (remaining template parameters should be inferred)
+    // Parameters:
+    //   report_error - functor to report any errors
+    //   service_arg - service argument, if any (may be null)
+    //   envmap - environment variables
+    //   report_lint - functor to report lint (default: don't report)
+    //   var_subst - functor to resolve environment variable values
+    // Throws:
+    //   service_description_exc, std::bad_alloc, std::length_error
+    //
+    // Note: we have the do_report_lint parameter to prevent code (and strings) being emitted for
+    // lint checks even when the dummy_lint function is used. (Ideally the compiler would optimise
+    // them away).
+    //
+    template <bool propagate_sde = false, typename T, typename U, typename V,
+            bool do_report_lint = !std::is_same<U, decltype(dummy_lint)>::value>
+    void finalise(T &report_error, const char *service_arg, const U &report_lint,
+            const V &var_subst)
+    {
+        if (service_type == service_type_t::PROCESS || service_type == service_type_t::BGPROCESS
+                || service_type == service_type_t::SCRIPTED) {
+            if (command.empty()) {
+                report_error("'command' setting not specified.");
+            }
+        }
+
+        if (do_report_lint && (service_type == service_type_t::INTERNAL
+                || service_type == service_type_t::TRIGGERED)) {
+            if (!command.empty()) {
+                report_lint("'command' specified, but ignored for the specified (or default)"
+                        " service type.");
+            }
+            if (!stop_command.empty()) {
+                report_lint("'stop-command' specified, but ignored for the specified (or default)"
+                        " service type.");
+            }
+            if (!working_dir.empty()) {
+                report_lint("'working-dir' specified, but ignored for the specified (or default)"
+                        " service type.");
+            }
+            #if SUPPORT_CGROUPS
+            if (!run_in_cgroup.empty()) {
+                report_lint("'run-in-cgroup' specified, but ignored for the specified (or default)"
+                        " service type.");
+            }
+            #endif
+            #if SUPPORT_CAPABILITIES
+            if (capabilities.get()) {
+                report_lint("'capabilities' specified, but ignored for the specified (or default)"
+                        " service type.");
+            }
+            if (secbits.get()) {
+                report_lint("'securebits' specified, but ignored for the specified (or default)"
+                        " service type.");
+            }
+            #endif
+            if (run_as_uid != (uid_t)-1) {
+                report_lint("'run-as' specified, but ignored for the specified (or default) service type.");
+            }
+            if (!socket_path.empty()) {
+                report_lint("'socket-listen' specified, but ignored for the specified (or default)"
+                        " service type.");
+            }
+            #if USE_UTMPX
+            if (inittab_id[0] != 0 || inittab_line[0] != 0) {
+                report_lint("'inittab_line' or 'inittab_id' specified, but ignored for the"
+                        " specified (or default) service type.");
+            }
+            #endif
+            if (onstart_flags.signal_process_only || onstart_flags.start_interruptible) {
+                report_lint("signal options were specified, but ignored for the specified (or"
+                        " default) service type.");
+            }
+            if (onstart_flags.pass_cs_fd) {
+                report_lint("option 'pass_cs_fd' was specified, but ignored for the specified (or"
+                        " default) service type.");
+            }
+            if (onstart_flags.skippable) {
+                report_lint("option 'skippable' was specified, but ignored for the specified (or"
+                        " default) service type.");
+            }
+            #if SUPPORT_CAPABILITIES
+            if (onstart_flags.no_new_privs) {
+                report_lint("option 'no_new_privs' was specified, but ignored for the specified (or"
+                        " default) service type.");
+            }
+            #endif
+            if (log_type != log_type_id::NONE) {
+                report_lint("option 'log_type' was specified, but ignored for the specified (or"
+                        " default) service type.");
+            }
+            if (nice_is_set) {
+                report_lint("option 'nice' was specified, but ignored for the specified (or"
+                        " default) service type.");
+            }
+            #if SUPPORT_IOPRIO
+            if (ioprio >= 0) {
+                report_lint("option 'ioprio' was specified, but ignored for the specified"
+                        " (or default) service type.");
+            }
+            #endif
+            #if SUPPORT_OOM_ADJ
+            if (oom_adj_is_set) {
+                report_lint("option 'oom-score-adj' was specified, but ignored for the specified"
+                        " (or default) service type.");
+            }
+            #endif
+        }
+
+        if (do_report_lint) {
+            if (log_type != log_type_id::LOGFILE && !logfile.empty()) {
+                report_lint("option 'logfile' was specified, but selected log type is not 'file'");
+            }
+            if (log_type == log_type_id::LOGFILE && logfile.empty()) {
+                report_lint("option 'logfile' not set, but selected log type is 'file'");
+            }
+        }
+
+        if (service_type == service_type_t::BGPROCESS) {
+            if (pid_file.empty()) {
+                report_error("process ID file ('pid-file') not specified for bgprocess service.");
+            }
+
+            if (readiness_fd != -1 || !readiness_var.empty()) {
+                report_error("readiness notification ('ready-notification') is not supported "
+                        "for bgprocess services.");
+            }
+        }
+
+        if (onstart_flags.kill_all_on_stop && service_type != service_type_t::INTERNAL
+                && service_type != service_type_t::SCRIPTED) {
+            report_error("kill-all-on-stop can only be set on scripted or internal services.");
+        }
+
+        // Resolve paths via variable substitution
+        {
+            auto do_resolve = [&](const char *setting_name, string &setting_value) {
+                try {
+                    list<pair<unsigned,unsigned>> str_offsets;
+                    str_offsets.emplace_back(0, setting_value.size());
+                    value_var_subst(setting_name, setting_value, str_offsets, var_subst, service_arg);
+                }
+                catch (service_description_exc &exc) {
+                    if (propagate_sde) throw;
+                    report_error((string() + setting_name + ": " + exc.exc_description).c_str());
+                }
+            };
+
+            do_resolve("socket-listen", socket_path);
+            do_resolve("logfile", logfile);
+            do_resolve("working-dir", working_dir);
+            do_resolve("pid-file", pid_file);
+
+            std::string command_s = std::string(command.c_str(), command.length());
+            std::string stop_command_s = std::string(stop_command.c_str(), stop_command.length());
+            value_var_subst("command", command_s, command_offsets, var_subst, service_arg);
+            value_var_subst("stop-command", stop_command_s, stop_command_offsets, var_subst, service_arg);
+            command = command_s;
+            stop_command = stop_command_s;
+        }
+
+        // If socket_gid hasn't been explicitly set, but the socket_uid was specified as a name (and
+        // we therefore recovered the primary group), use the primary group of the specified user.
+        if (socket_gid == (gid_t)-1) socket_gid = socket_uid_gid;
+        // Also for logfile_uid/gid, we reset logfile ownership to haiku process uid/gid if uid/gid
+        // wasn't specified by service
+        if (logfile_uid == (uid_t) -1) logfile_uid = getuid();
+        if (logfile_gid == (gid_t)-1) logfile_gid = logfile_uid_gid;
+        if (logfile_gid == (gid_t)-1) logfile_gid = getgid();
+        // likewise for "run as" gid/uid, but only if we aren't supporting supplementary group initialisation
+        // (if we do support supplementary groups, run_as_gid==-1 means "use the user groups including
+        // supplementary groups" whereas run_as_gid==X means "use group X with no supplementary groups").
+#if USE_INITGROUPS
+        if (run_as_uid_gid == (gid_t)-1 && run_as_gid == (gid_t)-1) {
+            // run-as-UID specified by number; set run_as_gid to inhibit initialisation of
+            // supplementary groups
+            run_as_gid = getgid();
+        }
+#else // !USE_INITGROUPS
+        if (run_as_gid == (gid_t)-1) run_as_gid = run_as_uid_gid;
+#endif
+
+        if (log_type != log_type_id::LOGFILE) {
+            logfile.clear();
+        }
+
+        if (!value(service_type).is_in(service_type_t::PROCESS, service_type_t::BGPROCESS)) {
+            if (!consumer_of_name.empty()) {
+                report_error("only a process or bgprocess service can be a log consumer "
+                        "('consumer-of') another service.");
+            }
+        }
+    }
+
+    // Finalise settings (after processing all setting lines), perform some basic sanity checks
+    // and optionally some additional lint checks. Resolve variables from provided env_map.
+    // See finalise() above.
+    // Template parameters:
+    //   (all should be inferred).
+    // Parameters:
+    //   report_error - functor to report any errors
+    //   envmap - environment variables
+    //   service_arg - service argument, if any (may be null)
+    //   report_lint - functor to report lint (default: don't report)
+    //   var_subst - functor to resolve environment variable values
+    // Throws:
+    //    service_description_exc, bad_alloc
+    template <bool propagate_sde = false, typename T, typename U = decltype(dummy_lint),
+            typename V = decltype(resolve_env_var),
+            bool do_report_lint = !std::is_same<U, decltype(dummy_lint)>::value>
+    void finalise(T &report_error, environment::env_map const &envmap, const char *service_arg,
+            U &report_lint = dummy_lint, V &var_subst = resolve_env_var)
+    {
+        auto do_var_subst = [&](const std::string &name) {
+            return var_subst(name, envmap);
+        };
+        finalise<propagate_sde, T, U, decltype(do_var_subst), do_report_lint>(report_error,
+                service_arg, report_lint, do_var_subst);
+    }
+};
+
+// Process a service description line. In general, parse the setting value and record the parsed
+// value in a service settings wrapper object. Errors will be reported via service_description_exc
+// exception.
+// Template parameters:
+//   settings_wrapper : wrapper for service settings
+//   load_service_t   : type of load service function/lambda (see below)
+//   process_dep_dir_t : type of process_dep_dir function/lambda (see below)
+// Parameters:
+//   settings     : wrapper object for service settings
+//   name         : name of the service being processed
+//   service_arg  : service argument, if any (may be null)
+//   line         : the text of the current line of the service description file
+//   input_pos    : the current input position (for error reporting)
+//   setting      : the name of the setting (from the beginning of line)
+//   setting_op   : the operator specified after the setting name
+//   i            : iterator at beginning of setting value (including whitespace)
+//   end          : iterator at end of line
+//   load_service : function to load a service
+//                    arguments:  const char *service_name
+//                    return: a value that can be used (with a dependency type) to construct a
+//                            dependency in the 'depends' vector within the 'settings' object
+//   process_dep_dir : function to process a dependency directory
+//                    arguments: decltype(settings.depends) &dependencies
+//                               const string &waitsford - directory as specified in parameter
+//                               dependency_type dep_type - type of dependency to add
+//   lookup_var   : function to look up a variable value
+// Throws:
+//  service_description_exc, service_load_error, std::bad_alloc,
+//  std::length_error (string too long; unlikely), anything thrown by lookup_var
+template <typename settings_wrapper,
+    typename load_service_t,
+    typename process_dep_dir_t,
+    typename lookup_var_t = decltype(null_resolve_env_var)>
+void process_service_line(settings_wrapper &settings, ::string_view name, const char *service_arg,
+        string &line, file_pos_ref input_pos, string &setting, setting_op_t setting_op,
+        string::iterator &i, string::iterator &end, load_service_t load_service,
+        process_dep_dir_t process_dep_dir, const lookup_var_t &lookup_var = null_resolve_env_var)
+{
+    // find the setting:
+    setting_details *details = all_settings;
+    while (setting != details->setting_str) {
+        details++;
+        if (details->setting_id == setting_id_t::LAST) {
+            throw service_description_exc(name, "unknown setting: '" + setting + "'.", input_pos);
+        }
+    }
+
+    if (setting_op == setting_op_t::PLUSASSIGN && !details->supp_plus_assign) {
+        throw service_description_exc(name, "cannot use '+=' with setting '" + setting + "'", input_pos);
+    }
+
+    // utility: validate a service name for a dependency, throw an exception on failure
+    auto validate_dep_name_x = [&](string &name){
+        if (!validate_service_name(name)) {
+            throw service_description_exc(name, std::string("invalid dependency name '")
+                    + name + "'", details->setting_str, input_pos);
+        }
+    };
+
+    switch (details->setting_id) {
+        case setting_id_t::COMMAND:
+            read_setting_value(settings.command, setting_op, input_pos, i, end, &settings.command_offsets);
+            break;
+        case setting_id_t::WORKING_DIR:
+            settings.working_dir = read_setting_value(input_pos, i, end, nullptr);
+            break;
+        case setting_id_t::ENV_FILE:
+            settings.env_file = read_value_resolved(details->setting_str, input_pos, i, end,
+                    service_arg, lookup_var);
+            if (settings.env_file[0] != '/') {
+                // We need to duplicate the resolve-fd as it is owned by the input stack and will
+                // be closed before the environment file is actually resolved
+                int rfd = input_pos.get_resolve_fd();
+                rfd = dup(rfd);
+                if (rfd == -1) {
+                    // Throwing a generic load_error is good enough; the error should relate to
+                    // inability to create a file descriptor (eg EMFILE or ENOMEM) and there's no
+                    // real point in indicating that this was for processing ENV_FILE.
+                    throw service_load_error(name, input_pos.get_file_name(), errno);
+                }
+                settings.env_file_dir_fd = rfd;
+            }
+            break;
+        #if SUPPORT_CGROUPS
+        case setting_id_t::RUN_IN_CGROUP:
+            settings.run_in_cgroup = read_setting_value(input_pos, i, end, nullptr);
+            break;
+        #endif
+        #if SUPPORT_CAPABILITIES
+        case setting_id_t::CAPABILITIES:
+        {
+            std::string capabilities_str;
+            read_setting_value(capabilities_str, setting_op, input_pos, i, end, nullptr, ',');
+
+            cap_iab_wrapper cap_iab(capabilities_str);
+            if (!cap_iab.get()) {
+                if (errno == ENOMEM) throw std::bad_alloc();
+                throw service_description_exc(name, "invalid capabilities: " + capabilities_str,
+                        details->setting_str, input_pos);
+            }
+            settings.capabilities = std::move(cap_iab);
+            break;
+        }
+        case setting_id_t::SECUREBITS:
+        {
+            std::list<std::pair<unsigned,unsigned>> indices;
+            string onstart_cmds = read_setting_value(input_pos, i, end, &indices);
+            // plain assignment will clear, while append will add more
+            if (setting_op != setting_op_t::PLUSASSIGN) {
+                settings.secbits.clear();
+            }
+            for (auto indexpair : indices) {
+                ::string_view secbit_txt { onstart_cmds.data() + indexpair.first,
+                        indexpair.second - indexpair.first };
+                if (secbit_txt == "keep-caps") {
+                    settings.secbits.set(SECBIT_KEEP_CAPS);
+                }
+                else if (secbit_txt == "keep-caps-locked") {
+                    settings.secbits.set(SECBIT_KEEP_CAPS_LOCKED);
+                }
+                else if (secbit_txt == "no-setuid-fixup") {
+                    settings.secbits.set(SECBIT_NO_SETUID_FIXUP);
+                }
+                else if (secbit_txt == "no-setuid-fixup-locked") {
+                    settings.secbits.set(SECBIT_NO_SETUID_FIXUP_LOCKED);
+                }
+                else if (secbit_txt == "noroot") {
+                    settings.secbits.set(SECBIT_NOROOT);
+                }
+                else if (secbit_txt == "noroot-locked") {
+                    settings.secbits.set(SECBIT_NOROOT_LOCKED);
+                }
+                else {
+                    throw service_description_exc(name, "unknown securebits flag: " + secbit_txt,
+                            details->setting_str, input_pos);
+                }
+            }
+            break;
+        }
+        #endif
+        case setting_id_t::NICE:
+        {
+            string nice_str = read_setting_value(input_pos, i, end);
+            settings.nice_is_set = true;
+            settings.nice = (int)parse_snum_param(input_pos, nice_str, name,
+                    std::numeric_limits<int>::min() / 2, std::numeric_limits<int>::max() / 2);
+            break;
+        }
+        #if SUPPORT_IOPRIO
+        case setting_id_t::IOPRIO:
+        {
+            string ioprio_str = read_setting_value(input_pos, i, end);
+            if (ioprio_str == "none") {
+                settings.ioprio = 0;
+            }
+            else if (starts_with(ioprio_str, "realtime:")) {
+                auto nval = parse_unum_param(input_pos, ioprio_str.substr(9 /* len 'realtime:' */),
+                        name, 7);
+                settings.ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_RT, nval);
+            }
+            else if (starts_with(ioprio_str, "best-effort:")) {
+                auto nval = parse_unum_param(input_pos, ioprio_str.substr(12 /* len 'best-effort:' */),
+                        name, 7);
+                settings.ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, nval);
+            }
+            else if (ioprio_str == "idle") {
+                settings.ioprio = 3 << 13;
+                settings.ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0);
+            }
+            else {
+                throw service_description_exc(name, cts::literal("invalid value for ") +
+                        setting_str::str_ioprio + ": " + ioprio_str, details->setting_str,
+                        input_pos);
+            }
+            break;
+        }
+        #endif
+        #if SUPPORT_OOM_ADJ
+        case setting_id_t::OOM_SCORE_ADJ:
+        {
+            string oom_adj_str = read_setting_value(input_pos, i, end);
+            settings.oom_adj_is_set = true;
+            settings.oom_adj = (int)parse_snum_param(input_pos, oom_adj_str, name, -1000, 1000);
+            break;
+        }
+        #endif
+        case setting_id_t::SOCKET_LISTEN:
+            settings.socket_path = read_setting_value(input_pos, i, end, nullptr);
+            break;
+        case setting_id_t::SOCKET_PERMISSIONS:
+        {
+            string sock_perm_str = read_setting_value(input_pos, i, end, nullptr);
+            settings.socket_perms = parse_perms(input_pos, sock_perm_str, name, details->setting_str);
+            break;
+        }
+        case setting_id_t::SOCKET_UID:
+        {
+            string sock_uid_s = read_setting_value(input_pos, i, end, nullptr);
+            settings.socket_uid = parse_uid_param(input_pos, sock_uid_s, name, details->setting_str,
+                    &settings.socket_uid_gid);
+            break;
+        }
+        case setting_id_t::SOCKET_GID:
+        {
+            string sock_gid_s = read_setting_value(input_pos, i, end, nullptr);
+            settings.socket_gid = parse_gid_param(input_pos, sock_gid_s, name, details->setting_str);
+            break;
+        }
+        case setting_id_t::STOP_COMMAND:
+            read_setting_value(settings.stop_command, setting_op, input_pos, i, end,
+                    &settings.stop_command_offsets);
+            break;
+        case setting_id_t::PID_FILE:
+            settings.pid_file = read_setting_value(input_pos, i, end);
+            break;
+        case setting_id_t::DEPENDS_ON:
+        {
+            string dependency_name = read_value_resolved(details->setting_str, input_pos, i, end,
+                    service_arg, lookup_var);
+            validate_dep_name_x(dependency_name);
+            settings.depends.emplace_back(load_service(dependency_name.c_str()),
+                    dependency_type::REGULAR);
+            break;
+        }
+        case setting_id_t::DEPENDS_MS:
+        {
+            string dependency_name = read_value_resolved(details->setting_str, input_pos, i, end,
+                    service_arg, lookup_var);
+            validate_dep_name_x(dependency_name);
+            settings.depends.emplace_back(load_service(dependency_name.c_str()),
+                    dependency_type::MILESTONE);
+            break;
+        }
+        case setting_id_t::WAITS_FOR:
+        {
+            string dependency_name = read_value_resolved(details->setting_str, input_pos, i, end,
+                    service_arg, lookup_var);
+            validate_dep_name_x(dependency_name);
+            settings.depends.emplace_back(load_service(dependency_name.c_str()),
+                    dependency_type::WAITS_FOR);
+            break;
+        }
+        case setting_id_t::WAITS_FOR_D:
+        {
+            string waitsford = read_value_resolved(details->setting_str, input_pos, i, end,
+                    service_arg, lookup_var);
+            process_dep_dir(settings.depends, waitsford, dependency_type::WAITS_FOR);
+            break;
+        }
+        case setting_id_t::DEPENDS_ON_D:
+        {
+            string depends_on_d = read_value_resolved(details->setting_str, input_pos, i, end,
+                    service_arg, lookup_var);
+            process_dep_dir(settings.depends, depends_on_d, dependency_type::REGULAR);
+            break;
+        }
+        case setting_id_t::DEPENDS_MS_D:
+        {
+            string depends_ms_d = read_value_resolved(details->setting_str, input_pos, i, end,
+                    service_arg, lookup_var);
+            process_dep_dir(settings.depends, depends_ms_d, dependency_type::MILESTONE);
+            break;
+        }
+        case setting_id_t::AFTER:
+        {
+            string after_name = read_value_resolved(details->setting_str, input_pos, i, end,
+                    service_arg, lookup_var);
+            if (!validate_service_name(after_name)) {
+                throw service_description_exc(name, std::string("invalid service name '")
+                        + after_name + "'", details->setting_str, input_pos);
+            }
+            settings.after_svcs.emplace_back(std::move(after_name));
+            break;
+        }
+        case setting_id_t::BEFORE:
+        {
+            string before_name = read_value_resolved(details->setting_str, input_pos, i, end,
+                    service_arg, lookup_var);
+            if (!validate_service_name(before_name)) {
+                throw service_description_exc(name, std::string("invalid service name '")
+                        + before_name + "'", details->setting_str, input_pos);
+            }
+            settings.before_svcs.emplace_back(std::move(before_name));
+            break;
+        }
+        case setting_id_t::PREPARED_BY:
+        {
+            string dependency_name = read_value_resolved(details->setting_str, input_pos, i, end,
+                    service_arg, lookup_var);
+            validate_dep_name_x(dependency_name);
+            settings.depends.emplace_back(load_service(dependency_name.c_str()),
+                    dependency_type::PREPARED_BY);
+            break;
+        }
+        case setting_id_t::LOGFILE:
+        {
+            settings.logfile = read_setting_value(input_pos, i, end);
+            if (!settings.logfile.empty() && settings.log_type == log_type_id::NONE) {
+                settings.log_type = log_type_id::LOGFILE;
+            }
+            break;
+        }
+        case setting_id_t::LOGFILE_PERMISSIONS:
+        {
+            string log_perm_str = read_setting_value(input_pos, i, end, nullptr);
+            settings.logfile_perms = parse_perms(input_pos, log_perm_str, name, details->setting_str);
+            break;
+        }
+        case setting_id_t::LOGFILE_UID:
+        {
+            string log_uid_s = read_setting_value(input_pos, i, end, nullptr);
+            settings.logfile_uid = parse_uid_param(input_pos, log_uid_s, name, details->setting_str,
+                    &settings.logfile_uid_gid);
+            break;
+        }
+        case setting_id_t::LOGFILE_GID:
+        {
+            string log_gid_s = read_setting_value(input_pos, i, end, nullptr);
+            settings.logfile_gid = parse_gid_param(input_pos, log_gid_s, name, details->setting_str);
+            break;
+        }
+        case setting_id_t::LOG_TYPE:
+        {
+            string log_type_str = read_setting_value(input_pos, i, end);
+            if (log_type_str == "file") {
+                settings.log_type = log_type_id::LOGFILE;
+            }
+            else if (log_type_str == "buffer") {
+                settings.log_type = log_type_id::BUFFER;
+            }
+            else if (log_type_str == "none") {
+                settings.log_type = log_type_id::NONE;
+            }
+            else if (log_type_str == "pipe") {
+                settings.log_type = log_type_id::PIPE;
+            }
+            else {
+                throw service_description_exc(name, "log type must be one of: \"file\", \"buffer\", \"pipe\","
+                        " or \"none\"", details->setting_str, input_pos);
+            }
+            break;
+        }
+        case setting_id_t::LOG_BUFFER_SIZE:
+        {
+            string log_buffer_size_str = read_setting_value(input_pos, i, end);
+            unsigned bufsize = (unsigned)parse_unum_param(input_pos, log_buffer_size_str, name,
+                    std::numeric_limits<unsigned>::max() / 2);
+            settings.max_log_buffer_sz = bufsize;
+            break;
+        }
+        case setting_id_t::CONSUMER_OF:
+        {
+            string consumed_svc_name = read_value_resolved(details->setting_str, input_pos, i,
+                    end, service_arg, lookup_var);
+            if (!validate_service_name(consumed_svc_name)) {
+                throw service_description_exc(name, std::string("invalid service name '")
+                        + consumed_svc_name + "'", details->setting_str, input_pos);
+            }
+            if (consumed_svc_name == name) {
+                throw service_description_exc(name, "service cannot be its own consumer",
+                        details->setting_str, input_pos);
+            }
+            settings.consumer_of_name = std::move(consumed_svc_name);
+            break;
+        }
+        case setting_id_t::RESTART:
+        {
+            string restart = read_setting_value(input_pos, i, end);
+            if (restart == "yes" || restart == "true") {
+                settings.auto_restart = auto_restart_mode::ALWAYS;
+            }
+            else if (restart == "on-failure") {
+                settings.auto_restart = auto_restart_mode::ON_FAILURE;
+            }
+            else if (restart == "no" || restart == "false") {
+                settings.auto_restart = auto_restart_mode::NEVER;
+            }
+            else {
+                throw service_description_exc(name, (setting_str::str_restart + " must be one of: "
+                        "\"yes\", \"true\", \"no\", \"false\" or \"on-failure\"").c_str(),
+                        details->setting_str, input_pos);
+            }
+            break;
+        }
+        case setting_id_t::SMOOTH_RECOVERY:
+        {
+            string recovery = read_setting_value(input_pos, i, end);
+            if (recovery == "yes" || recovery == "true") {
+                settings.smooth_recovery = true;
+            }
+            else if (recovery == "no" || recovery == "false") {
+                settings.smooth_recovery = false;
+            }
+            else {
+                throw service_description_exc(name, (setting_str::str_smooth_recovery + " must be"
+                        " one of: \"yes\", \"true\", \"no\" or \"false\"").c_str(),
+                        details->setting_str, input_pos);
+            }
+            break;
+        }
+        case setting_id_t::TYPE:
+        {
+            string type_str = read_setting_value(input_pos, i, end);
+            if (type_str == "scripted") {
+                settings.service_type = service_type_t::SCRIPTED;
+            }
+            else if (type_str == "process") {
+                settings.service_type = service_type_t::PROCESS;
+            }
+            else if (type_str == "bgprocess") {
+                settings.service_type = service_type_t::BGPROCESS;
+            }
+            else if (type_str == "internal") {
+                settings.service_type = service_type_t::INTERNAL;
+            }
+            else if (type_str == "triggered") {
+                settings.service_type = service_type_t::TRIGGERED;
+            }
+            else {
+                throw service_description_exc(name, "service type must be one of: \"scripted\","
+                    " \"process\", \"bgprocess\", \"internal\" or \"triggered\"",
+                    details->setting_str, input_pos);
+            }
+            break;
+        }
+        case setting_id_t::OPTIONS:
+        {
+            std::list<std::pair<unsigned,unsigned>> indices;
+            string onstart_cmds = read_setting_value(input_pos, i, end, &indices);
+            for (auto indexpair : indices) {
+                ::string_view option_txt { onstart_cmds.data() + indexpair.first,
+                        indexpair.second - indexpair.first };
+                if (option_txt == "starts-rwfs") {
+                    settings.onstart_flags.rw_ready = true;
+                }
+                else if (option_txt == "starts-log") {
+                    settings.onstart_flags.log_ready = true;
+                }
+                else if (option_txt == "runs-on-console") {
+                    settings.onstart_flags.runs_on_console = true;
+                    // A service that runs on the console necessarily starts on console:
+                    settings.onstart_flags.starts_on_console = true;
+                    settings.onstart_flags.shares_console = false;
+                }
+                else if (option_txt == "starts-on-console") {
+                    settings.onstart_flags.starts_on_console = true;
+                    settings.onstart_flags.shares_console = false;
+                }
+                else if (option_txt == "shares-console") {
+                    settings.onstart_flags.shares_console = true;
+                    settings.onstart_flags.runs_on_console = false;
+                    settings.onstart_flags.starts_on_console = false;
+                }
+                else if (option_txt == "unmask-intr") {
+                    settings.onstart_flags.unmask_intr = true;
+                }
+                else if (option_txt == "pass-cs-fd") {
+                    settings.onstart_flags.pass_cs_fd = true;
+                }
+                else if (option_txt == "start-interruptible") {
+                    settings.onstart_flags.start_interruptible = true;
+                }
+                else if (option_txt == "skippable") {
+                    settings.onstart_flags.skippable = true;
+                }
+                else if (option_txt == "signal-process-only") {
+                    settings.onstart_flags.signal_process_only = true;
+                }
+                else if (option_txt == "always-chain") {
+                    settings.onstart_flags.always_chain = true;
+                }
+                else if (option_txt == "kill-all-on-stop") {
+                    settings.onstart_flags.kill_all_on_stop = true;
+                }
+#if SUPPORT_CAPABILITIES
+                else if (option_txt == "no-new-privs") {
+                    settings.onstart_flags.no_new_privs = true;
+                }
+#endif
+                else {
+                    throw service_description_exc(name, "unknown option: " + option_txt,
+                            details->setting_str, input_pos);
+                }
+            }
+            break;
+        }
+        case setting_id_t::LOAD_OPTIONS:
+        {
+            std::list<std::pair<unsigned,unsigned>> indices;
+            string load_opts = read_setting_value(input_pos, i, end, &indices);
+            for (auto indexpair : indices) {
+                ::string_view option_txt { load_opts.data() + indexpair.first,
+                        indexpair.second - indexpair.first };
+                if (option_txt == "export-passwd-vars") {
+                    settings.export_passwd_vars = true;
+                }
+                else if (option_txt == "export-service-name") {
+                    settings.export_service_name = true;
+                }
+                else if (option_txt == "sub-vars") {
+                    // noop: for backwards compatibility only
+                    // we don't support no-sub-vars anymore, however
+                }
+                else {
+                    throw service_description_exc(name, "unknown load option: " + option_txt,
+                            details->setting_str, input_pos);
+                }
+            }
+            break;
+        }
+        case setting_id_t::TERM_SIGNAL:
+        case setting_id_t::TERMSIGNAL:
+        {
+            // Note: "termsignal" supported for legacy reasons.
+            string signame = read_setting_value(input_pos, i, end, nullptr);
+            int signo = signal_name_to_number(signame);
+            if (signo == -1) {
+                throw service_description_exc(name, "unknown/unsupported termination signal: "
+                        + signame, details->setting_str, input_pos);
+            }
+            else {
+                settings.term_signal = signo;
+            }
+            break;
+        }
+        case setting_id_t::RESTART_LIMIT_INTERVAL:
+        {
+            string interval_str = read_setting_value(input_pos, i, end, nullptr);
+            parse_timespec(input_pos, interval_str, name, details->setting_str,
+                    settings.restart_interval);
+            break;
+        }
+        case setting_id_t::RESTART_DELAY:
+        {
+            string rsdelay_str = read_setting_value(input_pos, i, end, nullptr);
+            parse_timespec(input_pos, rsdelay_str, name, details->setting_str, settings.restart_delay);
+            break;
+        }
+        case setting_id_t::RESTART_LIMIT_COUNT: {
+            string limit_str = read_setting_value(input_pos, i, end, nullptr);
+            settings.max_restarts = parse_unum_param(input_pos, limit_str, name,
+                    std::numeric_limits<int>::max());
+            break;
+        }
+        case setting_id_t::STOP_TIMEOUT:
+        {
+            string stoptimeout_str = read_setting_value(input_pos, i, end, nullptr);
+            parse_timespec(input_pos, stoptimeout_str, name, details->setting_str, settings.stop_timeout);
+            break;
+        }
+        case setting_id_t::START_TIMEOUT:
+        {
+            string starttimeout_str = read_setting_value(input_pos, i, end, nullptr);
+            parse_timespec(input_pos, starttimeout_str, name, details->setting_str, settings.start_timeout);
+            break;
+        }
+        case setting_id_t::RUN_AS:
+        {
+            string run_as_str = read_setting_value(input_pos, i, end, nullptr);
+            settings.run_as_uid = parse_uid_param(input_pos, run_as_str, name, details->setting_str,
+                    &settings.run_as_uid_gid);
+            break;
+        }
+        case setting_id_t::CHAIN_TO:
+            settings.chain_to_name = read_value_resolved(details->setting_str, input_pos, i, end,
+                    service_arg, lookup_var);
+            if (!validate_service_name(settings.chain_to_name)) {
+                throw service_description_exc(name, std::string("invalid chain-to service name '")
+                        + settings.chain_to_name + "'", details->setting_str, input_pos);
+            }
+            break;
+        case setting_id_t::READY_NOTIFICATION:
+        {
+            string notify_setting = read_setting_value(input_pos, i, end, nullptr);
+            if (starts_with(notify_setting, "pipefd:")) {
+                settings.readiness_fd = parse_unum_param(input_pos,
+                        notify_setting.substr(7 /* len 'pipefd:' */),
+                        name, std::numeric_limits<int>::max());
+            }
+            else if (starts_with(notify_setting, "pipevar:")) {
+                settings.readiness_var = notify_setting.substr(8 /* len 'pipevar:' */);
+                if (settings.readiness_var.empty()) {
+                    throw service_description_exc(name, "invalid pipevar variable name",
+                            details->setting_str, input_pos);
+                }
+            }
+            else {
+                throw service_description_exc(name, "unrecognised setting: " + notify_setting,
+                        details->setting_str, input_pos);
+            }
+            break;
+        }
+        case setting_id_t::INITTAB_ID:
+        {
+            string inittab_setting = read_setting_value(input_pos, i, end, nullptr);
+            #if USE_UTMPX
+                if (inittab_setting.length() > sizeof(settings.inittab_id)) {
+                    throw service_description_exc(name, (setting_str::str_inittab_id + " setting "
+                            "is too long").c_str(), input_pos);
+                }
+                strncpy(settings.inittab_id, inittab_setting.c_str(), sizeof(settings.inittab_id));
+            #endif
+            break;
+        }
+        case setting_id_t::INITTAB_LINE:
+        {
+            string inittab_setting = read_setting_value(input_pos, i, end, nullptr);
+            #if USE_UTMPX
+                if (inittab_setting.length() > sizeof(settings.inittab_line)) {
+                    throw service_description_exc(name, (setting_str::str_inittab_line
+                            + " setting is too long").c_str(), input_pos);
+                }
+                strncpy(settings.inittab_line, inittab_setting.c_str(), sizeof(settings.inittab_line));
+            #endif
+            break;
+        }
+        case setting_id_t::SETTING_RLIMIT_NOFILE:
+        {
+            string nofile_setting = read_setting_value(input_pos, i, end, nullptr);
+            service_rlimits &nofile_limits = find_rlimits(settings.rlimits, RLIMIT_NOFILE);
+            parse_rlimit(nofile_setting, input_pos, name, details->setting_str, nofile_limits);
+            break;
+        }
+        case setting_id_t::SETTING_RLIMIT_CORE:
+        {
+            string core_setting = read_setting_value(input_pos, i, end, nullptr);
+            service_rlimits &core_limits = find_rlimits(settings.rlimits, RLIMIT_CORE);
+            parse_rlimit(core_setting, input_pos, name, details->setting_str, core_limits);
+            break;
+        }
+        case setting_id_t::SETTING_RLIMIT_DATA:
+        {
+            string data_setting = read_setting_value(input_pos, i, end, nullptr);
+            service_rlimits &data_limits = find_rlimits(settings.rlimits, RLIMIT_DATA);
+            parse_rlimit(data_setting, input_pos, name, details->setting_str, data_limits);
+            break;
+        }
+        case setting_id_t::SETTING_RLIMIT_ADDRSPACE:
+        {
+            #if defined(RLIMIT_AS)
+                string addrspace_setting = read_setting_value(input_pos, i, end, nullptr);
+                service_rlimits &as_limits = find_rlimits(settings.rlimits, RLIMIT_AS);
+                parse_rlimit(addrspace_setting, input_pos, name, details->setting_str, as_limits);
+            #endif
+            break;
+        }
+        case setting_id_t::LAST:
+#ifdef __GNUC__
+            __builtin_unreachable();
+#else
+            break;
+#endif
+    }
+}
+
+} // namespace haiku_load
+
+using haiku_load::process_service_file;
+
+#endif /* LOAD_SERVICE_H_INCLUDED */

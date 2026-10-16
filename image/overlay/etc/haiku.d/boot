@@ -1,0 +1,6 @@
+# Interaktif açılış hedefi (varsayılan)
+@type       = internal
+@waits-for  = syslog
+@waits-for  = heartbeat
+@waits-for  = webdemo
+@waits-for  = console

@@ -1,0 +1,4 @@
+Haiku, Dinit (https://github.com/davmac314/dinit, Davin McCall ve katkıda bulunanlar,
+Apache License 2.0) kaynak kodunun yeniden adlandırılmış ve yamalanmış bir türevidir.
+LICENSE dosyası ve kaynak dosyalardaki telif bildirimleri korunmalıdır.
+Değişiklikler: dinit->haiku adlandırması; "@ayar = değer" sözdizimi (src/includes/load-service.h).

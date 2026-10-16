@@ -1,0 +1,4 @@
+# Sadece loopback (test için yeterli)
+@type       = scripted
+@command    = /usr/libexec/haiku/network.sh
+@depends-on = early-fs

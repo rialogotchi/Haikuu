@@ -1,0 +1,12 @@
+# Auxillary (non-root) filesystems
+
+type = scripted
+command = /etc/haiku.d/filesystems.sh start
+restart = false
+logfile = /var/log/haiku-filesystems.log
+start-timeout = 1200   # 20 minutes
+
+depends-on: udevd
+depends-on: rootrw
+waits-for: auxfscheck
+waits-for: udev-settle

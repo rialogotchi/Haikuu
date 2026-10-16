@@ -1,0 +1,6 @@
+Fish shell completion for Haiku
+===============================
+
+Currently only covers haikuctl, but it does so fairly thoroughly.
+
+To install, copy the file into `~/.config/fish/completions/`.

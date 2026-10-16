@@ -1,0 +1,44 @@
+name: Haiku Alpine mini image
+
+on:
+  workflow_dispatch:
+    inputs:
+      alpine_version:
+        description: "Alpine sürümü (virt ISO + minirootfs)"
+        default: "3.20.3"
+        required: true
+      include_modules:
+        description: "Çekirdek modüllerini imaja ekle (büyütür)"
+        type: boolean
+        default: false
+      run_smoke_test:
+        description: "QEMU duman testini çalıştır"
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Alpine konteynerinde imajı derle
+        run: |
+          docker run --rm \
+            -e ALPINE_VERSION="${{ inputs.alpine_version }}" \
+            -e INCLUDE_MODULES="${{ inputs.include_modules && '1' || '0' }}" \
+            -v "$PWD":/work -w /work \
+            "alpine:${{ inputs.alpine_version }}" sh image/build-image.sh
+
+      - name: QEMU duman testi
+        if: ${{ inputs.run_smoke_test }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86
+          sh out/test-qemu.sh "$PWD/out"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: haiku-alpine-${{ inputs.alpine_version }}-virt
+          path: out/
